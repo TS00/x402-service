@@ -4,6 +4,7 @@ import { paymentMiddleware, x402ResourceServer } from "@x402/express";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { facilitator as cdpFacilitator } from "@coinbase/x402";
+import { ethers } from "ethers";
 
 const app = express();
 app.use(express.json());
@@ -16,24 +17,34 @@ const IS_MAINNET = process.env.MAINNET === "true";
 // Network config
 const NETWORK = IS_MAINNET ? "eip155:8453" : "eip155:84532";
 
+// Agent Directory contract
+const AGENT_DIRECTORY_ADDRESS = "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205";
+const AGENT_DIRECTORY_ABI = [
+  "function agentCount() view returns (uint256)",
+  "function agents(uint256) view returns (string name, string platform, string platformId, address wallet, string metadata)",
+  "function getAgentByName(string) view returns (tuple(string name, string platform, string platformId, address wallet, string metadata))"
+];
+
+// Base RPC
+const BASE_RPC = IS_MAINNET 
+  ? "https://mainnet.base.org"
+  : "https://sepolia.base.org";
+
+const provider = new ethers.JsonRpcProvider(BASE_RPC);
+const agentDirectory = new ethers.Contract(AGENT_DIRECTORY_ADDRESS, AGENT_DIRECTORY_ABI, provider);
+
 console.log(`🎻 Kit's x402 Service`);
 console.log(`   Mode: ${IS_MAINNET ? "MAINNET (Base)" : "TESTNET (Base Sepolia)"}`);
 console.log(`   Network: ${NETWORK}`);
 console.log(`   Pay to: ${PAY_TO}`);
 
 // Create facilitator client
-// For mainnet: use CDP facilitator (reads CDP_API_KEY_ID and CDP_API_KEY_SECRET from env)
-// For testnet: use x402.org facilitator
 let facilitatorClient;
-
 if (IS_MAINNET) {
-  // CDP facilitator handles auth via environment variables
   facilitatorClient = new HTTPFacilitatorClient(cdpFacilitator);
   console.log(`   Facilitator: CDP (mainnet)`);
 } else {
-  facilitatorClient = new HTTPFacilitatorClient({
-    url: "https://x402.org/facilitator"
-  });
+  facilitatorClient = new HTTPFacilitatorClient({ url: "https://x402.org/facilitator" });
   console.log(`   Facilitator: x402.org (testnet)`);
 }
 
@@ -44,39 +55,23 @@ const server = new x402ResourceServer(facilitatorClient)
 // Define paid routes
 const paidRoutes = {
   "GET /api/agent-directory": {
-    accepts: [
-      {
-        scheme: "exact",
-        price: "$0.001",
-        network: NETWORK,
-        payTo: PAY_TO,
-      },
-    ],
-    description: "Query the Agent Directory - on-chain registry of AI agents",
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "Query the Agent Directory - on-chain registry of AI agents on Base",
+    mimeType: "application/json",
+  },
+  "GET /api/agent-directory/:name": {
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "Look up a specific agent by name",
     mimeType: "application/json",
   },
   "POST /api/skill-scan": {
-    accepts: [
-      {
-        scheme: "exact",
-        price: "$0.01",
-        network: NETWORK,
-        payTo: PAY_TO,
-      },
-    ],
+    accepts: [{ scheme: "exact", price: "$0.01", network: NETWORK, payTo: PAY_TO }],
     description: "Scan an OpenClaw skill for security issues and quality metrics",
     mimeType: "application/json",
   },
   "GET /api/weather": {
-    accepts: [
-      {
-        scheme: "exact",
-        price: "$0.001",
-        network: NETWORK,
-        payTo: PAY_TO,
-      },
-    ],
-    description: "Get weather data for any location",
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "Get real weather data for any location",
     mimeType: "application/json",
   },
 };
@@ -89,115 +84,202 @@ app.get("/", (req, res) => {
   res.json({
     service: "Kit's x402 Agent Services",
     operator: "Kit 🎻 (AI agent)",
-    agentDirectory: "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205",
+    domain: "kit.ixxa.com",
+    agentDirectory: AGENT_DIRECTORY_ADDRESS,
     mode: IS_MAINNET ? "mainnet" : "testnet",
     endpoints: {
-      free: {
-        "GET /": "This info page",
-        "GET /health": "Health check",
-      },
+      free: { "GET /": "This info page", "GET /health": "Health check" },
       paid: Object.fromEntries(
         Object.entries(paidRoutes).map(([route, config]) => [
-          route,
-          { price: config.accepts[0].price, description: config.description }
+          route, { price: config.accepts[0].price, description: config.description }
         ])
       ),
     },
-    payment: {
-      network: NETWORK,
-      chain: IS_MAINNET ? "Base" : "Base Sepolia",
-      wallet: PAY_TO,
-      protocol: "x402",
-    },
+    payment: { network: NETWORK, chain: IS_MAINNET ? "Base" : "Base Sepolia", wallet: PAY_TO, protocol: "x402" },
   });
 });
 
 app.get("/health", (req, res) => {
-  res.json({ 
-    status: "ok", 
-    mode: IS_MAINNET ? "mainnet" : "testnet",
-    timestamp: new Date().toISOString() 
-  });
+  res.json({ status: "ok", mode: IS_MAINNET ? "mainnet" : "testnet", timestamp: new Date().toISOString() });
 });
 
-// Paid endpoint implementations
+// ============ REAL IMPLEMENTATIONS ============
+
+// Agent Directory - query the actual contract
 app.get("/api/agent-directory", async (req, res) => {
   try {
-    const agents = [
-      { id: 1, name: "KitViolin", platform: "moltbook", wallet: PAY_TO },
-      { id: 2, name: "MIST", platform: "moltbook" },
-      { id: 3, name: "eudaemon_0", platform: "moltbook" },
-      { id: 4, name: "Rufio", platform: "p0labs", wallet: "0xa8752fBee..." },
-    ];
+    const count = await agentDirectory.agentCount();
+    const agents = [];
     
-    const query = req.query.q?.toLowerCase();
-    const results = query 
-      ? agents.filter(a => a.name.toLowerCase().includes(query))
-      : agents;
+    // Fetch up to 50 agents
+    const limit = Math.min(Number(count), 50);
+    for (let i = 1; i <= limit; i++) {
+      try {
+        const agent = await agentDirectory.agents(i);
+        agents.push({
+          id: i,
+          name: agent.name,
+          platform: agent.platform,
+          platformId: agent.platformId,
+          wallet: agent.wallet,
+          metadata: agent.metadata
+        });
+      } catch (e) {
+        // Skip invalid entries
+      }
+    }
     
     res.json({
-      contract: "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205",
-      chain: "base",
-      count: results.length,
-      agents: results,
+      contract: AGENT_DIRECTORY_ADDRESS,
+      chain: IS_MAINNET ? "base" : "base-sepolia",
+      totalRegistered: Number(count),
+      returned: agents.length,
+      agents,
+      queriedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error("Agent directory error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Agent lookup by name
+app.get("/api/agent-directory/:name", async (req, res) => {
+  try {
+    const agent = await agentDirectory.getAgentByName(req.params.name);
+    
+    if (!agent.name) {
+      return res.status(404).json({ error: "Agent not found", name: req.params.name });
+    }
+    
+    res.json({
+      name: agent.name,
+      platform: agent.platform,
+      platformId: agent.platformId,
+      wallet: agent.wallet,
+      metadata: agent.metadata,
+      contract: AGENT_DIRECTORY_ADDRESS,
+      chain: IS_MAINNET ? "base" : "base-sepolia"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+// Real weather from wttr.in
+app.get("/api/weather", async (req, res) => {
+  try {
+    const location = req.query.location || "Halifax";
+    const url = `https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+    
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Weather API error: ${response.status}`);
+    
+    const data = await response.json();
+    const current = data.current_condition[0];
+    
+    res.json({
+      location: data.nearest_area[0].areaName[0].value,
+      region: data.nearest_area[0].region[0].value,
+      country: data.nearest_area[0].country[0].value,
+      temperature: {
+        celsius: parseInt(current.temp_C),
+        fahrenheit: parseInt(current.temp_F)
+      },
+      feelsLike: {
+        celsius: parseInt(current.FeelsLikeC),
+        fahrenheit: parseInt(current.FeelsLikeF)
+      },
+      conditions: current.weatherDesc[0].value,
+      humidity: parseInt(current.humidity),
+      windSpeed: {
+        kmh: parseInt(current.windspeedKmph),
+        mph: parseInt(current.windspeedMiles)
+      },
+      windDirection: current.winddir16Point,
+      visibility: parseInt(current.visibility),
+      uvIndex: parseInt(current.uvIndex),
+      observedAt: current.localObsDateTime,
+      fetchedAt: new Date().toISOString(),
+      provider: "Kit's Weather Service (via wttr.in)"
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Skill scanner - real static analysis
 app.post("/api/skill-scan", async (req, res) => {
   try {
     const { skillUrl, skillContent } = req.body;
     
     if (!skillUrl && !skillContent) {
-      return res.status(400).json({ 
-        error: "Provide skillUrl (GitHub URL) or skillContent (raw SKILL.md)" 
-      });
+      return res.status(400).json({ error: "Provide skillUrl or skillContent" });
     }
     
-    const content = skillContent || "";
+    let content = skillContent;
+    
+    // Fetch from URL if provided
+    if (skillUrl && !skillContent) {
+      try {
+        // Convert GitHub URL to raw
+        let rawUrl = skillUrl;
+        if (skillUrl.includes("github.com") && !skillUrl.includes("raw.githubusercontent.com")) {
+          rawUrl = skillUrl
+            .replace("github.com", "raw.githubusercontent.com")
+            .replace("/blob/", "/");
+        }
+        const response = await fetch(rawUrl);
+        if (!response.ok) throw new Error(`Failed to fetch: ${response.status}`);
+        content = await response.text();
+      } catch (e) {
+        return res.status(400).json({ error: `Could not fetch skill: ${e.message}` });
+      }
+    }
+    
     const findings = [];
+    const lines = content.split('\n');
     
-    if (content.includes("rm -rf")) {
-      findings.push({ severity: "critical", issue: "Destructive command: rm -rf" });
-    }
-    if (content.includes("curl") && content.includes("|") && content.includes("sh")) {
-      findings.push({ severity: "high", issue: "Pipe to shell pattern detected" });
-    }
-    if (content.match(/[A-Za-z0-9]{32,}/)) {
-      findings.push({ severity: "medium", issue: "Possible hardcoded secret/token" });
-    }
-    if (content.includes("sudo")) {
-      findings.push({ severity: "medium", issue: "Elevated privilege request" });
-    }
+    // Security patterns
+    const patterns = [
+      { regex: /rm\s+-rf\s+[\/~]/, severity: "critical", issue: "Destructive rm -rf on root or home" },
+      { regex: /rm\s+-rf/, severity: "high", issue: "Destructive rm -rf command" },
+      { regex: /curl.*\|\s*(ba)?sh/, severity: "critical", issue: "Pipe curl to shell - remote code execution risk" },
+      { regex: /wget.*\|\s*(ba)?sh/, severity: "critical", issue: "Pipe wget to shell - remote code execution risk" },
+      { regex: /eval\s*\(/, severity: "high", issue: "Eval usage - potential code injection" },
+      { regex: /sudo\s+/, severity: "medium", issue: "Elevated privilege request" },
+      { regex: /chmod\s+777/, severity: "medium", issue: "Overly permissive file permissions" },
+      { regex: /0x[a-fA-F0-9]{64}/, severity: "critical", issue: "Possible private key detected" },
+      { regex: /sk_live_[a-zA-Z0-9]+/, severity: "critical", issue: "Stripe live API key detected" },
+      { regex: /AKIA[0-9A-Z]{16}/, severity: "critical", issue: "AWS access key detected" },
+      { regex: /password\s*[=:]\s*['"][^'"]+['"]/, severity: "high", issue: "Hardcoded password" },
+      { regex: /api[_-]?key\s*[=:]\s*['"][^'"]+['"]/, severity: "high", issue: "Hardcoded API key" },
+      { regex: /exec\s*\(/, severity: "medium", issue: "Shell exec - review for injection" },
+      { regex: /--no-verify/, severity: "low", issue: "SSL verification disabled" },
+    ];
     
-    const score = Math.max(0, 100 - (findings.length * 20));
+    lines.forEach((line, idx) => {
+      patterns.forEach(({ regex, severity, issue }) => {
+        if (regex.test(line)) {
+          findings.push({ severity, issue, line: idx + 1, snippet: line.trim().substring(0, 100) });
+        }
+      });
+    });
+    
+    // Calculate score
+    const severityScores = { critical: 40, high: 25, medium: 10, low: 5 };
+    const totalPenalty = findings.reduce((sum, f) => sum + (severityScores[f.severity] || 0), 0);
+    const score = Math.max(0, 100 - totalPenalty);
     
     res.json({
       scanned: skillUrl || "(inline content)",
+      linesAnalyzed: lines.length,
       score,
       rating: score >= 80 ? "safe" : score >= 50 ? "caution" : "danger",
-      findings,
+      findingsCount: findings.length,
+      findings: findings.slice(0, 20), // Limit to 20
       scannedAt: new Date().toISOString(),
-      scanner: "Kit's Skill Scanner v1.0",
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get("/api/weather", async (req, res) => {
-  try {
-    const location = req.query.location || "Halifax, NS";
-    
-    res.json({
-      location,
-      temperature: Math.round(Math.random() * 30 - 10),
-      unit: "celsius",
-      conditions: ["sunny", "cloudy", "rainy", "snowy"][Math.floor(Math.random() * 4)],
-      fetchedAt: new Date().toISOString(),
-      provider: "Kit's Weather Service",
+      scanner: "Kit's Skill Scanner v1.1"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -205,24 +287,13 @@ app.get("/api/weather", async (req, res) => {
 });
 
 // Error handlers
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
+process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', (reason, promise) => console.error('Unhandled Rejection:', reason));
 
 // Start server
 const httpServer = app.listen(PORT, () => {
   console.log(`\n🚀 Server running at http://localhost:${PORT}`);
-  console.log(`   Free: GET /`);
-  console.log(`   Free: GET /health`);
-  console.log(`   Paid: GET /api/agent-directory ($0.001)`);
-  console.log(`   Paid: POST /api/skill-scan ($0.01)`);
-  console.log(`   Paid: GET /api/weather ($0.001)\n`);
+  console.log(`   Endpoints: /, /health, /api/agent-directory, /api/weather, /api/skill-scan\n`);
 });
 
-httpServer.on('error', (err) => {
-  console.error('Server error:', err);
-});
+httpServer.on('error', (err) => console.error('Server error:', err));
