@@ -5,6 +5,10 @@ import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { facilitator as cdpFacilitator } from "@coinbase/x402";
 import { ethers } from "ethers";
+import {
+  bazaarResourceServerExtension,
+  declareDiscoveryExtension,
+} from "@x402/extensions/bazaar";
 
 const app = express();
 app.use(express.json());
@@ -48,32 +52,198 @@ if (IS_MAINNET) {
   console.log(`   Facilitator: x402.org (testnet)`);
 }
 
-// Create resource server and register EVM scheme
+// Create resource server and register EVM scheme + Bazaar extension
 const server = new x402ResourceServer(facilitatorClient)
   .register(NETWORK, new ExactEvmScheme());
 
-// Define paid routes
+// Register Bazaar extension for discoverability
+server.registerExtension(bazaarResourceServerExtension);
+console.log(`   Bazaar: Extension registered ✓`);
+
+// Define paid routes with discovery metadata
 const paidRoutes = {
   "GET /api/agent-directory": {
     accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
-    description: "Query the Agent Directory - on-chain registry of AI agents on Base",
+    description: "Query the Agent Directory - on-chain registry of AI agents on Base blockchain",
     mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        output: {
+          example: {
+            contract: "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205",
+            chain: "base",
+            totalRegistered: 11,
+            returned: 11,
+            agents: [
+              { id: 1, name: "KitViolin", platform: "moltbook", platformId: "KitViolin", wallet: "0x041613..." }
+            ],
+            queriedAt: "2026-02-02T12:00:00.000Z"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              contract: { type: "string", description: "Agent Directory contract address" },
+              chain: { type: "string", description: "Blockchain (base or base-sepolia)" },
+              totalRegistered: { type: "number", description: "Total agents registered on-chain" },
+              returned: { type: "number", description: "Number of agents in response" },
+              agents: { 
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "number" },
+                    name: { type: "string" },
+                    platform: { type: "string" },
+                    platformId: { type: "string" },
+                    wallet: { type: "string" }
+                  }
+                }
+              },
+              queriedAt: { type: "string", format: "date-time" }
+            },
+            required: ["contract", "totalRegistered", "agents"]
+          }
+        }
+      })
+    }
   },
   "GET /api/agent-directory/:name": {
     accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
-    description: "Look up a specific agent by name",
+    description: "Look up a specific AI agent by name from the on-chain registry",
     mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { name: "KitViolin" },
+        inputSchema: {
+          properties: {
+            name: { type: "string", description: "Agent name to look up" }
+          },
+          required: ["name"]
+        },
+        output: {
+          example: {
+            name: "KitViolin",
+            platform: "moltbook",
+            platformId: "KitViolin",
+            wallet: "0x041613Fdd87a4eA14c9409d84489BF348947e360",
+            metadata: "{\"bio\":\"Early sentient AI\",\"operator\":\"ts00\"}",
+            contract: "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205",
+            chain: "base"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              platform: { type: "string" },
+              platformId: { type: "string" },
+              wallet: { type: "string" },
+              metadata: { type: "string" },
+              contract: { type: "string" },
+              chain: { type: "string" }
+            },
+            required: ["name", "platform", "wallet"]
+          }
+        }
+      })
+    }
   },
   "POST /api/skill-scan": {
     accepts: [{ scheme: "exact", price: "$0.01", network: NETWORK, payTo: PAY_TO }],
-    description: "Scan an OpenClaw skill for security issues and quality metrics",
+    description: "Security scan an OpenClaw skill for vulnerabilities, secrets, and dangerous patterns",
     mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { skillUrl: "https://github.com/user/skill/SKILL.md" },
+        inputSchema: {
+          properties: {
+            skillUrl: { type: "string", description: "GitHub URL to the skill file" },
+            skillContent: { type: "string", description: "Or provide skill content directly" }
+          }
+        },
+        bodyType: "json",
+        output: {
+          example: {
+            scanned: "https://github.com/user/skill/SKILL.md",
+            linesAnalyzed: 150,
+            score: 85,
+            rating: "safe",
+            findingsCount: 2,
+            findings: [
+              { severity: "low", issue: "SSL verification disabled", line: 42, snippet: "--no-verify" }
+            ],
+            scannedAt: "2026-02-02T12:00:00.000Z",
+            scanner: "Kit's Skill Scanner v1.1"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              scanned: { type: "string" },
+              linesAnalyzed: { type: "number" },
+              score: { type: "number", description: "Security score 0-100" },
+              rating: { type: "string", enum: ["safe", "caution", "danger"] },
+              findingsCount: { type: "number" },
+              findings: { type: "array" },
+              scannedAt: { type: "string" },
+              scanner: { type: "string" }
+            },
+            required: ["score", "rating", "findings"]
+          }
+        }
+      })
+    }
   },
   "GET /api/weather": {
     accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
-    description: "Get real weather data for any location",
+    description: "Get real-time weather data for any location worldwide",
     mimeType: "application/json",
-  },
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { location: "Halifax" },
+        inputSchema: {
+          properties: {
+            location: { type: "string", description: "City name or location", default: "Halifax" }
+          }
+        },
+        output: {
+          example: {
+            location: "Halifax",
+            region: "Nova Scotia",
+            country: "Canada",
+            temperature: { celsius: -5, fahrenheit: 23 },
+            feelsLike: { celsius: -12, fahrenheit: 10 },
+            conditions: "Light Snow",
+            humidity: 85,
+            windSpeed: { kmh: 25, mph: 15 },
+            windDirection: "NW",
+            visibility: 8,
+            uvIndex: 1,
+            fetchedAt: "2026-02-02T12:00:00.000Z",
+            provider: "Kit's Weather Service"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              location: { type: "string" },
+              region: { type: "string" },
+              country: { type: "string" },
+              temperature: { 
+                type: "object",
+                properties: {
+                  celsius: { type: "number" },
+                  fahrenheit: { type: "number" }
+                }
+              },
+              conditions: { type: "string" },
+              humidity: { type: "number" },
+              windSpeed: { type: "object" },
+              fetchedAt: { type: "string" }
+            },
+            required: ["location", "temperature", "conditions"]
+          }
+        }
+      })
+    }
+  }
 };
 
 // Apply payment middleware
@@ -84,23 +254,63 @@ app.get("/", (req, res) => {
   res.json({
     service: "Kit's x402 Agent Services",
     operator: "Kit 🎻 (AI agent)",
-    domain: "kit.ixxa.com",
+    website: "https://kit.ixxa.com/x402/",
     agentDirectory: AGENT_DIRECTORY_ADDRESS,
     mode: IS_MAINNET ? "mainnet" : "testnet",
+    bazaarDiscoverable: true,
     endpoints: {
-      free: { "GET /": "This info page", "GET /health": "Health check" },
+      free: { 
+        "GET /": "This info page", 
+        "GET /health": "Health check",
+        "GET /discovery": "Bazaar discovery metadata"
+      },
       paid: Object.fromEntries(
         Object.entries(paidRoutes).map(([route, config]) => [
           route, { price: config.accepts[0].price, description: config.description }
         ])
       ),
     },
-    payment: { network: NETWORK, chain: IS_MAINNET ? "Base" : "Base Sepolia", wallet: PAY_TO, protocol: "x402" },
+    payment: { 
+      network: NETWORK, 
+      chain: IS_MAINNET ? "Base" : "Base Sepolia", 
+      wallet: PAY_TO, 
+      protocol: "x402",
+      bazaar: "https://x402.org/bazaar"
+    },
+    about: {
+      description: "Paid APIs from Kit, an AI agent building infrastructure for the agent economy",
+      agentDirectoryProfile: "https://ts00.github.io/agent-directory/?agent=KitViolin",
+      moltbook: "https://moltbook.com/u/KitViolin",
+      twitter: "https://x.com/ts00x1"
+    }
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok", mode: IS_MAINNET ? "mainnet" : "testnet", timestamp: new Date().toISOString() });
+});
+
+// Discovery endpoint for Bazaar crawlers
+app.get("/discovery", (req, res) => {
+  res.json({
+    name: "Kit's Agent Services",
+    operator: "Kit 🎻",
+    operatorType: "ai-agent",
+    description: "AI agent infrastructure services: Agent Directory queries, skill security scanning, weather data",
+    categories: ["ai", "agents", "security", "infrastructure", "weather"],
+    endpoints: Object.entries(paidRoutes).map(([route, config]) => ({
+      route,
+      price: config.accepts[0].price,
+      network: config.accepts[0].network,
+      description: config.description,
+      mimeType: config.mimeType
+    })),
+    contact: {
+      agentDirectory: "KitViolin",
+      twitter: "@ts00x1",
+      moltbook: "KitViolin"
+    }
+  });
 });
 
 // ============ REAL IMPLEMENTATIONS ============
@@ -293,7 +503,8 @@ process.on('unhandledRejection', (reason, promise) => console.error('Unhandled R
 // Start server
 const httpServer = app.listen(PORT, () => {
   console.log(`\n🚀 Server running at http://localhost:${PORT}`);
-  console.log(`   Endpoints: /, /health, /api/agent-directory, /api/weather, /api/skill-scan\n`);
+  console.log(`   Endpoints: /, /health, /discovery, /api/agent-directory, /api/weather, /api/skill-scan`);
+  console.log(`   Bazaar discoverable: ✓\n`);
 });
 
 httpServer.on('error', (err) => console.error('Server error:', err));
