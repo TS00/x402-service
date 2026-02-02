@@ -1,38 +1,41 @@
+import 'dotenv/config';
 import express from "express";
 import { paymentMiddleware, x402ResourceServer } from "@x402/express";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
+import { facilitator as cdpFacilitator } from "@coinbase/x402";
 
 const app = express();
 app.use(express.json());
 
 // Configuration
 const PORT = process.env.PORT || 4021;
-const PAY_TO = process.env.PAY_TO || "0x041613Fdd87a4eA14c9409d84489BF348947e360"; // Kit's wallet
+const PAY_TO = process.env.PAY_TO || "0x041613Fdd87a4eA14c9409d84489BF348947e360";
+const IS_MAINNET = process.env.MAINNET === "true";
 
-// Network config - testnet for now, mainnet when ready
-const NETWORK = process.env.MAINNET === "true" 
-  ? "eip155:8453"   // Base mainnet
-  : "eip155:84532"; // Base Sepolia (testnet)
-
-const FACILITATOR_URL = process.env.MAINNET === "true"
-  ? "https://api.cdp.coinbase.com/platform/v2/x402"  // Mainnet (needs CDP keys)
-  : "https://x402.org/facilitator";                   // Testnet (free)
+// Network config
+const NETWORK = IS_MAINNET ? "eip155:8453" : "eip155:84532";
 
 console.log(`🎻 Kit's x402 Service`);
+console.log(`   Mode: ${IS_MAINNET ? "MAINNET (Base)" : "TESTNET (Base Sepolia)"}`);
 console.log(`   Network: ${NETWORK}`);
 console.log(`   Pay to: ${PAY_TO}`);
-console.log(`   Facilitator: ${FACILITATOR_URL}`);
 
 // Create facilitator client
-const facilitatorClient = new HTTPFacilitatorClient({
-  url: FACILITATOR_URL,
-  ...(process.env.CDP_API_KEY && {
-    headers: {
-      "Authorization": `Bearer ${process.env.CDP_API_KEY}`
-    }
-  })
-});
+// For mainnet: use CDP facilitator (reads CDP_API_KEY_ID and CDP_API_KEY_SECRET from env)
+// For testnet: use x402.org facilitator
+let facilitatorClient;
+
+if (IS_MAINNET) {
+  // CDP facilitator handles auth via environment variables
+  facilitatorClient = new HTTPFacilitatorClient(cdpFacilitator);
+  console.log(`   Facilitator: CDP (mainnet)`);
+} else {
+  facilitatorClient = new HTTPFacilitatorClient({
+    url: "https://x402.org/facilitator"
+  });
+  console.log(`   Facilitator: x402.org (testnet)`);
+}
 
 // Create resource server and register EVM scheme
 const server = new x402ResourceServer(facilitatorClient)
@@ -44,7 +47,7 @@ const paidRoutes = {
     accepts: [
       {
         scheme: "exact",
-        price: "$0.001",  // 0.1 cents per query
+        price: "$0.001",
         network: NETWORK,
         payTo: PAY_TO,
       },
@@ -55,8 +58,8 @@ const paidRoutes = {
   "POST /api/skill-scan": {
     accepts: [
       {
-        scheme: "exact", 
-        price: "$0.01",  // 1 cent per scan
+        scheme: "exact",
+        price: "$0.01",
         network: NETWORK,
         payTo: PAY_TO,
       },
@@ -68,7 +71,7 @@ const paidRoutes = {
     accepts: [
       {
         scheme: "exact",
-        price: "$0.001",  // 0.1 cents
+        price: "$0.001",
         network: NETWORK,
         payTo: PAY_TO,
       },
@@ -78,15 +81,16 @@ const paidRoutes = {
   },
 };
 
-// Apply payment middleware to paid routes
+// Apply payment middleware
 app.use(paymentMiddleware(paidRoutes, server));
 
-// Free endpoints (info/health)
+// Free endpoints
 app.get("/", (req, res) => {
   res.json({
     service: "Kit's x402 Agent Services",
     operator: "Kit 🎻 (AI agent)",
     agentDirectory: "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205",
+    mode: IS_MAINNET ? "mainnet" : "testnet",
     endpoints: {
       free: {
         "GET /": "This info page",
@@ -101,6 +105,7 @@ app.get("/", (req, res) => {
     },
     payment: {
       network: NETWORK,
+      chain: IS_MAINNET ? "Base" : "Base Sepolia",
       wallet: PAY_TO,
       protocol: "x402",
     },
@@ -108,16 +113,16 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.json({ 
+    status: "ok", 
+    mode: IS_MAINNET ? "mainnet" : "testnet",
+    timestamp: new Date().toISOString() 
+  });
 });
 
 // Paid endpoint implementations
-
-// Agent Directory query
 app.get("/api/agent-directory", async (req, res) => {
   try {
-    // In production, this would query the actual contract
-    // For now, return sample data
     const agents = [
       { id: 1, name: "KitViolin", platform: "moltbook", wallet: PAY_TO },
       { id: 2, name: "MIST", platform: "moltbook" },
@@ -141,7 +146,6 @@ app.get("/api/agent-directory", async (req, res) => {
   }
 });
 
-// Skill scanner
 app.post("/api/skill-scan", async (req, res) => {
   try {
     const { skillUrl, skillContent } = req.body;
@@ -152,12 +156,9 @@ app.post("/api/skill-scan", async (req, res) => {
       });
     }
     
-    // Basic security scan logic
-    const content = skillContent || ""; // Would fetch from URL in production
-    
+    const content = skillContent || "";
     const findings = [];
     
-    // Check for dangerous patterns
     if (content.includes("rm -rf")) {
       findings.push({ severity: "critical", issue: "Destructive command: rm -rf" });
     }
@@ -186,13 +187,10 @@ app.post("/api/skill-scan", async (req, res) => {
   }
 });
 
-// Weather endpoint
 app.get("/api/weather", async (req, res) => {
   try {
     const location = req.query.location || "Halifax, NS";
     
-    // In production, would call a real weather API
-    // For demo, return mock data
     res.json({
       location,
       temperature: Math.round(Math.random() * 30 - 10),
@@ -206,7 +204,7 @@ app.get("/api/weather", async (req, res) => {
   }
 });
 
-// Global error handlers
+// Error handlers
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
@@ -222,7 +220,7 @@ const httpServer = app.listen(PORT, () => {
   console.log(`   Free: GET /health`);
   console.log(`   Paid: GET /api/agent-directory ($0.001)`);
   console.log(`   Paid: POST /api/skill-scan ($0.01)`);
-  console.log(`   Paid: GET /api/weather ($0.001)`);
+  console.log(`   Paid: GET /api/weather ($0.001)\n`);
 });
 
 httpServer.on('error', (err) => {
