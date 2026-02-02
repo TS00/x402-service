@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: kit-x402-service
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.mjs
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: PAY_TO
+        value: 0x041613Fdd87a4eA14c9409d84489BF348947e360
+      - key: MAINNET
+        sync: false  # Set to "true" when CDP keys are configured
+      - key: CDP_API_KEY
+        sync: false  # Add via Render dashboard for mainnet
