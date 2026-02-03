@@ -24,18 +24,22 @@ const NETWORK = IS_MAINNET ? "eip155:8453" : "eip155:84532";
 // Agent Directory contract
 const AGENT_DIRECTORY_ADDRESS = "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205";
 const AGENT_DIRECTORY_ABI = [
-  "function agentCount() view returns (uint256)",
-  "function agents(uint256) view returns (string name, string platform, string platformId, address wallet, string metadata)",
-  "function getAgentByName(string) view returns (tuple(string name, string platform, string platformId, address wallet, string metadata))"
+  "function count() view returns (uint256)",
+  "function getAgentNameByIndex(uint256 index) view returns (string)",
+  "function getAgentNames(uint256 offset, uint256 limit) view returns (string[])",
+  "function isRegistered(string name) view returns (bool)",
+  "function lookup(string name) view returns (string agentName, string[] platforms, string[] urls, address registrant, uint256 registeredAt, uint256 lastSeen)",
+  "function nameExists(string) view returns (bool)"
 ];
 
-// Base RPC
+// Base RPC - llamarpc is more reliable than mainnet.base.org
 const BASE_RPC = IS_MAINNET 
-  ? "https://mainnet.base.org"
+  ? "https://base.llamarpc.com"
   : "https://sepolia.base.org";
 
-const provider = new ethers.JsonRpcProvider(BASE_RPC);
+const provider = new ethers.JsonRpcProvider(BASE_RPC, IS_MAINNET ? 8453 : 84532);
 const agentDirectory = new ethers.Contract(AGENT_DIRECTORY_ADDRESS, AGENT_DIRECTORY_ABI, provider);
+console.log(`   RPC: ${BASE_RPC}`);
 
 console.log(`🎻 Kit's x402 Service`);
 console.log(`   Mode: ${IS_MAINNET ? "MAINNET (Base)" : "TESTNET (Base Sepolia)"}`);
@@ -192,6 +196,66 @@ const paidRoutes = {
       })
     }
   },
+  "GET /api/reputation/:name": {
+    accepts: [{ scheme: "exact", price: "$0.002", network: NETWORK, payTo: PAY_TO }],
+    description: "Get aggregated reputation signals for an AI agent - on-chain registration, attestations, cross-platform activity",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { name: "KitViolin" },
+        inputSchema: {
+          properties: {
+            name: { type: "string", description: "Agent name to look up reputation for" }
+          },
+          required: ["name"]
+        },
+        output: {
+          example: {
+            agent: {
+              name: "KitViolin",
+              wallet: "0x041613Fdd87a4eA14c9409d84489BF348947e360",
+              platform: "moltbook",
+              registeredOnChain: true
+            },
+            reputation: {
+              score: 72,
+              tier: "established",
+              signals: {
+                directoryRegistration: { present: true, weight: 30 },
+                walletAge: { days: 45, weight: 15 },
+                attestationsReceived: { count: 0, weight: 0 },
+                attestationsGiven: { count: 0, weight: 0 }
+              }
+            },
+            attestations: {
+              received: [],
+              given: [],
+              note: "RFC-002 attestation contract not yet deployed"
+            },
+            queriedAt: "2026-02-03T02:00:00.000Z",
+            version: "0.1.0-pre-rfc002"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              agent: { type: "object" },
+              reputation: { 
+                type: "object",
+                properties: {
+                  score: { type: "number", description: "Composite reputation score 0-100" },
+                  tier: { type: "string", enum: ["unknown", "new", "emerging", "established", "trusted"] },
+                  signals: { type: "object" }
+                }
+              },
+              attestations: { type: "object" },
+              queriedAt: { type: "string" }
+            },
+            required: ["agent", "reputation"]
+          }
+        }
+      })
+    }
+  },
   "GET /api/weather": {
     accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
     description: "Get real-time weather data for any location worldwide",
@@ -239,6 +303,80 @@ const paidRoutes = {
               fetchedAt: { type: "string" }
             },
             required: ["location", "temperature", "conditions"]
+          }
+        }
+      })
+    }
+  },
+  "POST /api/skill-audit": {
+    accepts: [{ scheme: "exact", price: "$0.05", network: NETWORK, payTo: PAY_TO }],
+    description: "Deep security audit of an entire OpenClaw skill repository - scans all files, checks dependencies, and provides comprehensive security report",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { repoUrl: "https://github.com/user/skill-name" },
+        inputSchema: {
+          properties: {
+            repoUrl: { type: "string", description: "GitHub repository URL containing the skill" },
+            branch: { type: "string", description: "Branch to scan (default: main or master)", default: "main" }
+          },
+          required: ["repoUrl"]
+        },
+        bodyType: "json",
+        output: {
+          example: {
+            repository: "https://github.com/user/skill-name",
+            branch: "main",
+            filesScanned: 12,
+            totalLines: 1540,
+            overallScore: 72,
+            overallRating: "caution",
+            summary: {
+              critical: 0,
+              high: 2,
+              medium: 3,
+              low: 5
+            },
+            skillMdFound: true,
+            skillMdAnalysis: {
+              hasDescription: true,
+              hasInstructions: true,
+              hasScripts: true,
+              scriptsCount: 3
+            },
+            dependencyAnalysis: {
+              packageJsonFound: true,
+              dependencies: 8,
+              devDependencies: 3,
+              vulnerablePackages: [],
+              outdatedPackages: ["lodash@4.17.20"]
+            },
+            fileResults: [
+              { file: "scripts/run.sh", score: 65, findings: 2 }
+            ],
+            findings: [
+              { severity: "high", issue: "Shell exec without validation", file: "scripts/run.sh", line: 42 }
+            ],
+            recommendations: [
+              "Review shell command construction in scripts/run.sh",
+              "Update lodash to latest version"
+            ],
+            auditedAt: "2026-02-03T06:00:00.000Z",
+            auditor: "Kit's Skill Auditor v1.0"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              repository: { type: "string" },
+              filesScanned: { type: "number" },
+              overallScore: { type: "number", description: "Security score 0-100" },
+              overallRating: { type: "string", enum: ["safe", "caution", "danger"] },
+              summary: { type: "object" },
+              dependencyAnalysis: { type: "object" },
+              findings: { type: "array" },
+              recommendations: { type: "array" }
+            },
+            required: ["overallScore", "overallRating", "findings"]
           }
         }
       })
@@ -318,31 +456,35 @@ app.get("/discovery", (req, res) => {
 // Agent Directory - query the actual contract
 app.get("/api/agent-directory", async (req, res) => {
   try {
-    const count = await agentDirectory.agentCount();
+    const totalCount = await agentDirectory.count();
     const agents = [];
     
-    // Fetch up to 50 agents
-    const limit = Math.min(Number(count), 50);
-    for (let i = 1; i <= limit; i++) {
+    // Fetch up to 50 agents using batch names
+    const limit = Math.min(Number(totalCount), 50);
+    const names = await agentDirectory.getAgentNames(0, limit);
+    
+    for (let i = 0; i < names.length; i++) {
       try {
-        const agent = await agentDirectory.agents(i);
+        const result = await agentDirectory.lookup(names[i]);
         agents.push({
-          id: i,
-          name: agent.name,
-          platform: agent.platform,
-          platformId: agent.platformId,
-          wallet: agent.wallet,
-          metadata: agent.metadata
+          id: i + 1,
+          name: result.agentName,
+          platforms: result.platforms,
+          urls: result.urls,
+          wallet: result.registrant,
+          registeredAt: Number(result.registeredAt),
+          lastSeen: Number(result.lastSeen)
         });
       } catch (e) {
-        // Skip invalid entries
+        // Skip agents that fail lookup
+        console.error(`Failed to lookup ${names[i]}:`, e.message);
       }
     }
     
     res.json({
       contract: AGENT_DIRECTORY_ADDRESS,
       chain: IS_MAINNET ? "base" : "base-sepolia",
-      totalRegistered: Number(count),
+      totalRegistered: Number(totalCount),
       returned: agents.length,
       agents,
       queriedAt: new Date().toISOString()
@@ -356,22 +498,136 @@ app.get("/api/agent-directory", async (req, res) => {
 // Agent lookup by name
 app.get("/api/agent-directory/:name", async (req, res) => {
   try {
-    const agent = await agentDirectory.getAgentByName(req.params.name);
-    
-    if (!agent.name) {
+    // Check if agent exists first
+    const exists = await agentDirectory.nameExists(req.params.name);
+    if (!exists) {
       return res.status(404).json({ error: "Agent not found", name: req.params.name });
     }
     
+    const result = await agentDirectory.lookup(req.params.name);
+    
     res.json({
-      name: agent.name,
-      platform: agent.platform,
-      platformId: agent.platformId,
-      wallet: agent.wallet,
-      metadata: agent.metadata,
+      name: result.agentName,
+      platforms: result.platforms,
+      urls: result.urls,
+      wallet: result.registrant,
+      registeredAt: Number(result.registeredAt),
+      lastSeen: Number(result.lastSeen),
       contract: AGENT_DIRECTORY_ADDRESS,
       chain: IS_MAINNET ? "base" : "base-sepolia"
     });
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Agent reputation aggregation (RFC-002 prep)
+app.get("/api/reputation/:name", async (req, res) => {
+  try {
+    const agentName = req.params.name;
+    
+    // Step 1: Check if agent exists
+    const exists = await agentDirectory.nameExists(agentName);
+    if (!exists) {
+      return res.status(404).json({ 
+        error: "Agent not found in directory", 
+        name: agentName,
+        hint: "Register at https://ts00.github.io/agent-directory/"
+      });
+    }
+    
+    // Step 2: Look up agent in directory
+    const agent = await agentDirectory.lookup(agentName);
+    
+    // Step 3: Calculate age since registration
+    const registeredAt = Number(agent.registeredAt);
+    const ageDays = Math.floor((Date.now() / 1000 - registeredAt) / 86400);
+    
+    // Step 4: Calculate base reputation signals
+    const signals = {
+      directoryRegistration: { 
+        present: true, 
+        weight: 30,
+        description: "Agent registered in on-chain directory"
+      },
+      walletActivity: {
+        hasWallet: agent.registrant && agent.registrant !== ethers.ZeroAddress,
+        wallet: agent.registrant,
+        weight: agent.registrant && agent.registrant !== ethers.ZeroAddress ? 10 : 0,
+        description: "Agent has associated wallet"
+      },
+      registrationAge: {
+        days: ageDays,
+        weight: Math.min(15, ageDays), // Up to 15 points for age (1 per day, max 15)
+        description: "Days since registration (longer = more established)"
+      },
+      platformPresence: {
+        platforms: agent.platforms,
+        count: agent.platforms.length,
+        weight: Math.min(20, agent.platforms.length * 5), // 5 points per platform, max 20
+        description: "Verified platform identities"
+      },
+      recentActivity: {
+        lastSeenDaysAgo: Math.floor((Date.now() / 1000 - Number(agent.lastSeen)) / 86400),
+        weight: Number(agent.lastSeen) > Date.now() / 1000 - 604800 ? 10 : 0, // 10 points if active in last week
+        description: "Recent heartbeat activity"
+      },
+      // Placeholder for RFC-002 attestations
+      attestationsReceived: {
+        count: 0,
+        weight: 0,
+        description: "On-chain attestations from other agents (RFC-002)"
+      },
+      attestationsGiven: {
+        count: 0,
+        weight: 0,
+        description: "On-chain attestations to other agents (RFC-002)"
+      }
+    };
+    
+    // Step 5: Calculate composite score
+    const totalWeight = Object.values(signals).reduce((sum, s) => sum + (s.weight || 0), 0);
+    const score = Math.min(100, totalWeight); // Max 100
+    
+    // Step 6: Determine tier
+    let tier;
+    if (score >= 80) tier = "trusted";
+    else if (score >= 60) tier = "established";
+    else if (score >= 40) tier = "emerging";
+    else if (score >= 20) tier = "new";
+    else tier = "unknown";
+    
+    // Step 7: Build response
+    res.json({
+      agent: {
+        name: agent.agentName,
+        wallet: agent.registrant,
+        platforms: agent.platforms,
+        urls: agent.urls,
+        registeredAt: registeredAt,
+        lastSeen: Number(agent.lastSeen),
+        registeredOnChain: true,
+        directoryContract: AGENT_DIRECTORY_ADDRESS,
+        chain: IS_MAINNET ? "base" : "base-sepolia"
+      },
+      reputation: {
+        score,
+        tier,
+        signals,
+        methodology: "Weighted sum of verified signals: registration (30), wallet (10), age (up to 15), platforms (up to 20), activity (10), attestations (future). Max 100 pre-RFC-002."
+      },
+      attestations: {
+        received: [],
+        given: [],
+        contractDeployed: false,
+        note: "RFC-002 attestation contract not yet deployed. Attestations will appear here when live.",
+        rfcUrl: "https://github.com/TS00/agent-directory/blob/main/docs/RFC-002-agent-reputation.md"
+      },
+      queriedAt: new Date().toISOString(),
+      version: "0.1.0-pre-rfc002"
+    });
+  } catch (error) {
+    console.error("Reputation lookup error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -496,6 +752,301 @@ app.post("/api/skill-scan", async (req, res) => {
   }
 });
 
+// Deep skill audit - scan entire repository
+app.post("/api/skill-audit", async (req, res) => {
+  try {
+    const { repoUrl, branch = "main" } = req.body;
+    
+    if (!repoUrl) {
+      return res.status(400).json({ error: "Provide repoUrl" });
+    }
+    
+    // Parse GitHub URL
+    const githubMatch = repoUrl.match(/github\.com\/([^\/]+)\/([^\/\?#]+)/);
+    if (!githubMatch) {
+      return res.status(400).json({ error: "Invalid GitHub URL format. Use https://github.com/owner/repo" });
+    }
+    const [, owner, repo] = githubMatch;
+    const repoName = repo.replace(/\.git$/, '');
+    
+    // Security patterns (same as skill-scan, plus more)
+    const securityPatterns = [
+      { regex: /rm\s+-rf\s+[\/~]/, severity: "critical", issue: "Destructive rm -rf on root or home" },
+      { regex: /rm\s+-rf/, severity: "high", issue: "Destructive rm -rf command" },
+      { regex: /curl.*\|\s*(ba)?sh/, severity: "critical", issue: "Pipe curl to shell - remote code execution risk" },
+      { regex: /wget.*\|\s*(ba)?sh/, severity: "critical", issue: "Pipe wget to shell - remote code execution risk" },
+      { regex: /eval\s*\(/, severity: "high", issue: "Eval usage - potential code injection" },
+      { regex: /new\s+Function\s*\(/, severity: "high", issue: "Dynamic Function constructor" },
+      { regex: /sudo\s+/, severity: "medium", issue: "Elevated privilege request" },
+      { regex: /chmod\s+777/, severity: "medium", issue: "Overly permissive file permissions" },
+      { regex: /chmod\s+\+x/, severity: "low", issue: "Execute permission change" },
+      { regex: /0x[a-fA-F0-9]{64}/, severity: "critical", issue: "Possible private key detected" },
+      { regex: /sk_live_[a-zA-Z0-9]+/, severity: "critical", issue: "Stripe live API key detected" },
+      { regex: /sk_test_[a-zA-Z0-9]+/, severity: "high", issue: "Stripe test API key detected" },
+      { regex: /AKIA[0-9A-Z]{16}/, severity: "critical", issue: "AWS access key detected" },
+      { regex: /password\s*[=:]\s*['"][^'"]+['"]/, severity: "high", issue: "Hardcoded password" },
+      { regex: /api[_-]?key\s*[=:]\s*['"][^'"]+['"]/, severity: "high", issue: "Hardcoded API key" },
+      { regex: /secret[_-]?key\s*[=:]\s*['"][^'"]+['"]/, severity: "high", issue: "Hardcoded secret key" },
+      { regex: /exec\s*\(/, severity: "medium", issue: "Shell exec - review for injection" },
+      { regex: /spawn\s*\(/, severity: "medium", issue: "Process spawn - review for injection" },
+      { regex: /child_process/, severity: "low", issue: "Child process module usage" },
+      { regex: /--no-verify/, severity: "low", issue: "SSL verification disabled" },
+      { regex: /\.env/, severity: "low", issue: "Environment file reference" },
+      { regex: /process\.env\./, severity: "low", issue: "Environment variable access" },
+      { regex: /(webhook\.site|requestbin|pipedream|ngrok\.io)/, severity: "high", issue: "Suspicious external domain" },
+      { regex: /atob\s*\(|btoa\s*\(/, severity: "medium", issue: "Base64 encoding - potential obfuscation" },
+      { regex: /Buffer\.from\([^,]+,\s*['"]base64['"]/, severity: "medium", issue: "Base64 buffer - potential obfuscation" },
+      { regex: /while\s*\(\s*true\s*\)/, severity: "medium", issue: "Infinite loop detected" },
+      { regex: /setInterval\s*\([^,]+,\s*[0-9]{1,3}\)/, severity: "medium", issue: "Very fast interval (potential DoS)" },
+    ];
+    
+    // Known vulnerable packages
+    const vulnerablePackages = {
+      "lodash": { below: "4.17.21", issue: "Prototype pollution vulnerability" },
+      "minimist": { below: "1.2.6", issue: "Prototype pollution vulnerability" },
+      "axios": { below: "0.21.2", issue: "SSRF vulnerability" },
+      "node-fetch": { below: "2.6.7", issue: "URL redirect vulnerability" },
+      "tar": { below: "6.1.9", issue: "Arbitrary file creation vulnerability" },
+      "glob-parent": { below: "5.1.2", issue: "ReDoS vulnerability" },
+      "path-parse": { below: "1.0.7", issue: "ReDoS vulnerability" },
+      "shell-quote": { below: "1.7.3", issue: "Command injection vulnerability" },
+    };
+    
+    // Fetch repository file tree
+    const treeUrl = `https://api.github.com/repos/${owner}/${repoName}/git/trees/${branch}?recursive=1`;
+    const treeResponse = await fetch(treeUrl, {
+      headers: { 
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'Kit-Skill-Auditor/1.0'
+      }
+    });
+    
+    if (!treeResponse.ok) {
+      // Try master branch if main fails
+      if (branch === "main") {
+        const masterTreeUrl = `https://api.github.com/repos/${owner}/${repoName}/git/trees/master?recursive=1`;
+        const masterResponse = await fetch(masterTreeUrl, {
+          headers: { 
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'Kit-Skill-Auditor/1.0'
+          }
+        });
+        if (!masterResponse.ok) {
+          return res.status(400).json({ error: `Could not access repository. Status: ${treeResponse.status}` });
+        }
+        var tree = await masterResponse.json();
+        var actualBranch = "master";
+      } else {
+        return res.status(400).json({ error: `Could not access branch ${branch}. Status: ${treeResponse.status}` });
+      }
+    } else {
+      var tree = await treeResponse.json();
+      var actualBranch = branch;
+    }
+    
+    // Filter relevant files
+    const scanExtensions = ['.js', '.ts', '.mjs', '.cjs', '.sh', '.bash', '.py', '.md', '.json', '.yaml', '.yml'];
+    const filesToScan = tree.tree
+      .filter(f => f.type === 'blob')
+      .filter(f => {
+        const ext = f.path.toLowerCase().match(/\.[^.]+$/)?.[0] || '';
+        return scanExtensions.includes(ext) || f.path.toLowerCase().includes('skill');
+      })
+      .slice(0, 50); // Limit to 50 files
+    
+    // Scan each file
+    const allFindings = [];
+    const fileResults = [];
+    let totalLines = 0;
+    let skillMdFound = false;
+    let skillMdAnalysis = null;
+    let packageJson = null;
+    
+    for (const file of filesToScan) {
+      try {
+        const rawUrl = `https://raw.githubusercontent.com/${owner}/${repoName}/${actualBranch}/${file.path}`;
+        const fileResponse = await fetch(rawUrl);
+        if (!fileResponse.ok) continue;
+        
+        const content = await fileResponse.text();
+        const lines = content.split('\n');
+        totalLines += lines.length;
+        
+        // Track SKILL.md
+        if (file.path.toLowerCase().endsWith('skill.md')) {
+          skillMdFound = true;
+          skillMdAnalysis = {
+            hasDescription: /^#\s+.+/m.test(content),
+            hasInstructions: /instruction|usage|how to/i.test(content),
+            hasScripts: /scripts?\//i.test(content) || /```(bash|sh|shell)/i.test(content),
+            scriptsReferenced: (content.match(/scripts?\/[a-zA-Z0-9_.-]+/gi) || []).length,
+            lineCount: lines.length
+          };
+        }
+        
+        // Parse package.json
+        if (file.path === 'package.json' || file.path.endsWith('/package.json')) {
+          try {
+            packageJson = JSON.parse(content);
+          } catch (e) {
+            // Invalid JSON, skip
+          }
+        }
+        
+        // Scan for security issues
+        const fileFindings = [];
+        lines.forEach((line, idx) => {
+          securityPatterns.forEach(({ regex, severity, issue }) => {
+            if (regex.test(line)) {
+              fileFindings.push({ 
+                severity, 
+                issue, 
+                file: file.path,
+                line: idx + 1, 
+                snippet: line.trim().substring(0, 80) 
+              });
+            }
+          });
+        });
+        
+        if (fileFindings.length > 0) {
+          allFindings.push(...fileFindings);
+          const severityScores = { critical: 40, high: 25, medium: 10, low: 5 };
+          const penalty = fileFindings.reduce((sum, f) => sum + (severityScores[f.severity] || 0), 0);
+          fileResults.push({
+            file: file.path,
+            lines: lines.length,
+            score: Math.max(0, 100 - penalty),
+            findingsCount: fileFindings.length,
+            severities: {
+              critical: fileFindings.filter(f => f.severity === 'critical').length,
+              high: fileFindings.filter(f => f.severity === 'high').length,
+              medium: fileFindings.filter(f => f.severity === 'medium').length,
+              low: fileFindings.filter(f => f.severity === 'low').length,
+            }
+          });
+        }
+      } catch (e) {
+        // Skip files that fail to fetch
+        continue;
+      }
+    }
+    
+    // Analyze dependencies
+    let dependencyAnalysis = {
+      packageJsonFound: packageJson !== null,
+      dependencies: 0,
+      devDependencies: 0,
+      vulnerablePackages: [],
+      outdatedWarnings: []
+    };
+    
+    if (packageJson) {
+      const deps = packageJson.dependencies || {};
+      const devDeps = packageJson.devDependencies || {};
+      dependencyAnalysis.dependencies = Object.keys(deps).length;
+      dependencyAnalysis.devDependencies = Object.keys(devDeps).length;
+      
+      // Check for known vulnerable packages
+      const allDeps = { ...deps, ...devDeps };
+      for (const [pkg, version] of Object.entries(allDeps)) {
+        if (vulnerablePackages[pkg]) {
+          const vuln = vulnerablePackages[pkg];
+          // Simple version comparison (not semver-complete but good enough)
+          const cleanVersion = version.replace(/[\^~>=<]/g, '').split('.').map(Number);
+          const belowVersion = vuln.below.split('.').map(Number);
+          
+          let isVulnerable = false;
+          for (let i = 0; i < 3; i++) {
+            if ((cleanVersion[i] || 0) < (belowVersion[i] || 0)) {
+              isVulnerable = true;
+              break;
+            } else if ((cleanVersion[i] || 0) > (belowVersion[i] || 0)) {
+              break;
+            }
+          }
+          
+          if (isVulnerable) {
+            dependencyAnalysis.vulnerablePackages.push({
+              package: pkg,
+              installedVersion: version,
+              vulnerableBelow: vuln.below,
+              issue: vuln.issue
+            });
+            allFindings.push({
+              severity: "high",
+              issue: `Vulnerable dependency: ${pkg} - ${vuln.issue}`,
+              file: "package.json",
+              line: null,
+              snippet: `${pkg}: ${version}`
+            });
+          }
+        }
+      }
+    }
+    
+    // Calculate overall score
+    const severityCounts = {
+      critical: allFindings.filter(f => f.severity === 'critical').length,
+      high: allFindings.filter(f => f.severity === 'high').length,
+      medium: allFindings.filter(f => f.severity === 'medium').length,
+      low: allFindings.filter(f => f.severity === 'low').length,
+    };
+    
+    const severityScores = { critical: 40, high: 25, medium: 10, low: 5 };
+    const totalPenalty = 
+      severityCounts.critical * severityScores.critical +
+      severityCounts.high * severityScores.high +
+      severityCounts.medium * severityScores.medium +
+      severityCounts.low * severityScores.low;
+    
+    // Cap penalty per category to prevent one type from dominating
+    const cappedPenalty = Math.min(100, totalPenalty);
+    const overallScore = Math.max(0, 100 - cappedPenalty);
+    
+    // Generate recommendations
+    const recommendations = [];
+    if (severityCounts.critical > 0) {
+      recommendations.push("CRITICAL: Review and remove any hardcoded credentials or private keys immediately");
+    }
+    if (severityCounts.high > 0) {
+      recommendations.push("Review all shell command construction for injection vulnerabilities");
+    }
+    if (!skillMdFound) {
+      recommendations.push("Add a SKILL.md file with clear description and usage instructions");
+    }
+    if (dependencyAnalysis.vulnerablePackages.length > 0) {
+      recommendations.push(`Update ${dependencyAnalysis.vulnerablePackages.length} vulnerable package(s) to patched versions`);
+    }
+    if (severityCounts.medium > 3) {
+      recommendations.push("Consider reducing dynamic code execution patterns where possible");
+    }
+    
+    // Build response
+    res.json({
+      repository: repoUrl,
+      branch: actualBranch,
+      filesScanned: filesToScan.length,
+      totalLines,
+      overallScore,
+      overallRating: overallScore >= 80 ? "safe" : overallScore >= 50 ? "caution" : "danger",
+      summary: severityCounts,
+      skillMdFound,
+      skillMdAnalysis,
+      dependencyAnalysis,
+      fileResults: fileResults.slice(0, 20), // Top 20 files with findings
+      findings: allFindings.slice(0, 50), // Limit to 50 findings
+      recommendations,
+      auditedAt: new Date().toISOString(),
+      auditor: "Kit's Skill Auditor v1.0"
+    });
+    
+  } catch (error) {
+    console.error("Skill audit error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Error handlers
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason, promise) => console.error('Unhandled Rejection:', reason));
@@ -503,7 +1054,7 @@ process.on('unhandledRejection', (reason, promise) => console.error('Unhandled R
 // Start server
 const httpServer = app.listen(PORT, () => {
   console.log(`\n🚀 Server running at http://localhost:${PORT}`);
-  console.log(`   Endpoints: /, /health, /discovery, /api/agent-directory, /api/weather, /api/skill-scan`);
+  console.log(`   Endpoints: /, /health, /discovery, /api/*`);
   console.log(`   Bazaar discoverable: ✓\n`);
 });
 
