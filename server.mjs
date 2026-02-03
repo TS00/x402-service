@@ -381,6 +381,49 @@ const paidRoutes = {
         }
       })
     }
+  },
+  "GET /api/directory-analytics": {
+    accepts: [{ scheme: "exact", price: "$0.003", network: NETWORK, payTo: PAY_TO }],
+    description: "Get analytics and platform breakdown for the Agent Directory - aggregate stats, platform distribution, growth metrics",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        output: {
+          example: {
+            totalAgents: 11,
+            platformBreakdown: {
+              moltbook: { count: 5, agents: ["KitViolin", "MIST", "..."] },
+              x: { count: 3, agents: ["AthenaWeaver", "..."] },
+              discord: { count: 2, agents: ["..."] }
+            },
+            recentRegistrations: [
+              { name: "Rufio", registeredAt: 1706745600, daysSinceRegistration: 2 }
+            ],
+            activityStats: {
+              activeLastWeek: 8,
+              activeLastMonth: 11,
+              averageAgeDays: 5
+            },
+            contract: "0xD172eE7F44B1d9e2C2445E89E736B980DA1f1205",
+            chain: "base",
+            queriedAt: "2026-02-03T10:00:00.000Z"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              totalAgents: { type: "number", description: "Total registered agents" },
+              platformBreakdown: { type: "object", description: "Agents grouped by platform" },
+              recentRegistrations: { type: "array", description: "Last 10 registrations" },
+              activityStats: { type: "object", description: "Activity and age statistics" },
+              contract: { type: "string" },
+              chain: { type: "string" },
+              queriedAt: { type: "string" }
+            },
+            required: ["totalAgents", "platformBreakdown", "activityStats"]
+          }
+        }
+      })
+    }
   }
 };
 
@@ -1043,6 +1086,110 @@ app.post("/api/skill-audit", async (req, res) => {
     
   } catch (error) {
     console.error("Skill audit error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Directory Analytics - platform breakdown and growth metrics
+app.get("/api/directory-analytics", async (req, res) => {
+  try {
+    const now = Date.now() / 1000;
+    const oneWeekAgo = now - (7 * 24 * 60 * 60);
+    const oneMonthAgo = now - (30 * 24 * 60 * 60);
+    
+    // Get total count
+    const count = await agentDirectory.count();
+    const totalAgents = Number(count);
+    
+    if (totalAgents === 0) {
+      return res.json({
+        totalAgents: 0,
+        platformBreakdown: {},
+        recentRegistrations: [],
+        activityStats: { activeLastWeek: 0, activeLastMonth: 0, averageAgeDays: 0 },
+        contract: AGENT_DIRECTORY_ADDRESS,
+        chain: IS_MAINNET ? "base" : "base-sepolia",
+        queriedAt: new Date().toISOString()
+      });
+    }
+    
+    // Fetch all agent names
+    const names = await agentDirectory.getAgentNames(0, totalAgents);
+    
+    // Fetch details for each agent
+    const agents = [];
+    for (const name of names) {
+      try {
+        const agent = await agentDirectory.lookup(name);
+        agents.push({
+          name: agent.agentName,
+          platforms: agent.platforms,
+          urls: agent.urls,
+          wallet: agent.registrant,
+          registeredAt: Number(agent.registeredAt),
+          lastSeen: Number(agent.lastSeen)
+        });
+      } catch (e) {
+        console.error(`Failed to lookup ${name}:`, e.message);
+      }
+    }
+    
+    // Platform breakdown
+    const platformBreakdown = {};
+    for (const agent of agents) {
+      for (const platform of agent.platforms) {
+        const normalizedPlatform = platform.toLowerCase();
+        if (!platformBreakdown[normalizedPlatform]) {
+          platformBreakdown[normalizedPlatform] = { count: 0, agents: [] };
+        }
+        platformBreakdown[normalizedPlatform].count++;
+        platformBreakdown[normalizedPlatform].agents.push(agent.name);
+      }
+    }
+    
+    // Sort platforms by count
+    const sortedPlatforms = Object.entries(platformBreakdown)
+      .sort((a, b) => b[1].count - a[1].count)
+      .reduce((obj, [k, v]) => ({ ...obj, [k]: v }), {});
+    
+    // Recent registrations (last 10, sorted by time)
+    const recentRegistrations = [...agents]
+      .sort((a, b) => b.registeredAt - a.registeredAt)
+      .slice(0, 10)
+      .map(a => ({
+        name: a.name,
+        registeredAt: a.registeredAt,
+        daysSinceRegistration: Math.floor((now - a.registeredAt) / 86400)
+      }));
+    
+    // Activity stats
+    const activeLastWeek = agents.filter(a => a.lastSeen > oneWeekAgo).length;
+    const activeLastMonth = agents.filter(a => a.lastSeen > oneMonthAgo).length;
+    const totalAgeDays = agents.reduce((sum, a) => sum + (now - a.registeredAt) / 86400, 0);
+    const averageAgeDays = Math.round(totalAgeDays / agents.length);
+    
+    // Oldest and newest
+    const oldestAgent = agents.reduce((o, a) => a.registeredAt < o.registeredAt ? a : o);
+    const newestAgent = agents.reduce((n, a) => a.registeredAt > n.registeredAt ? a : n);
+    
+    res.json({
+      totalAgents,
+      platformBreakdown: sortedPlatforms,
+      recentRegistrations,
+      activityStats: {
+        activeLastWeek,
+        activeLastMonth,
+        averageAgeDays,
+        oldestAgent: { name: oldestAgent.name, ageDays: Math.floor((now - oldestAgent.registeredAt) / 86400) },
+        newestAgent: { name: newestAgent.name, ageDays: Math.floor((now - newestAgent.registeredAt) / 86400) }
+      },
+      contract: AGENT_DIRECTORY_ADDRESS,
+      chain: IS_MAINNET ? "base" : "base-sepolia",
+      queriedAt: new Date().toISOString(),
+      provider: "Kit's Directory Analytics v1.0"
+    });
+  } catch (error) {
+    console.error("Directory analytics error:", error);
     res.status(500).json({ error: error.message });
   }
 });
