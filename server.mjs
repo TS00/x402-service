@@ -9,9 +9,46 @@ import {
   bazaarResourceServerExtension,
   declareDiscoveryExtension,
 } from "@x402/extensions/bazaar";
+import { appendFileSync, existsSync, readFileSync } from "fs";
 
 const app = express();
 app.use(express.json());
+
+// ============ PAYMENT LOGGING ============
+const PAYMENTS_LOG = "./payments.log";
+const STATS_FILE = "./stats.json";
+
+// Initialize stats if not exists
+if (!existsSync(STATS_FILE)) {
+  appendFileSync(STATS_FILE, JSON.stringify({ totalRevenue: 0, totalRequests: 0, byEndpoint: {} }));
+}
+
+function logPayment(endpoint, price, payer = "unknown") {
+  const timestamp = new Date().toISOString();
+  const priceNum = parseFloat(price.replace("$", ""));
+  
+  // Log to file
+  const logEntry = `${timestamp}|${endpoint}|${price}|${payer}\n`;
+  appendFileSync(PAYMENTS_LOG, logEntry);
+  
+  // Update stats
+  try {
+    const stats = JSON.parse(readFileSync(STATS_FILE, 'utf8'));
+    stats.totalRevenue = (stats.totalRevenue || 0) + priceNum;
+    stats.totalRequests = (stats.totalRequests || 0) + 1;
+    stats.byEndpoint[endpoint] = (stats.byEndpoint[endpoint] || 0) + 1;
+    stats.lastPayment = { timestamp, endpoint, price };
+    appendFileSync(STATS_FILE, ''); // Touch file
+    // Rewrite stats (atomic would be better but this works for now)
+    require('fs').writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+  } catch (e) {
+    console.error("Stats update failed:", e.message);
+  }
+  
+  console.log(`💰 PAYMENT: ${endpoint} | ${price} | ${payer}`);
+}
+
+// Logging middleware will be added after paidRoutes is defined
 
 // Configuration
 const PORT = process.env.PORT || 4021;
@@ -430,6 +467,28 @@ const paidRoutes = {
 // Apply payment middleware
 app.use(paymentMiddleware(paidRoutes, server));
 
+// Payment logging middleware (after payment verified)
+app.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = (data) => {
+    // If this was a paid endpoint and response is successful
+    if (res.statusCode === 200 && req.path.startsWith('/api/')) {
+      const route = `${req.method} ${req.path}`;
+      const routeConfig = Object.entries(paidRoutes).find(([r]) => {
+        const [method, path] = r.split(' ');
+        const pathRegex = new RegExp('^' + path.replace(/:\w+/g, '[^/]+') + '$');
+        return method === req.method && pathRegex.test(req.path);
+      });
+      if (routeConfig) {
+        const price = routeConfig[1].accepts[0].price;
+        logPayment(route, price);
+      }
+    }
+    return originalJson(data);
+  };
+  next();
+});
+
 // Free endpoints
 app.get("/", (req, res) => {
   res.json({
@@ -443,7 +502,8 @@ app.get("/", (req, res) => {
       free: { 
         "GET /": "This info page", 
         "GET /health": "Health check",
-        "GET /discovery": "Bazaar discovery metadata"
+        "GET /discovery": "Bazaar discovery metadata",
+        "GET /api/stats": "Free stats - agent directory overview, service info"
       },
       paid: Object.fromEntries(
         Object.entries(paidRoutes).map(([route, config]) => [
@@ -494,7 +554,46 @@ app.get("/discovery", (req, res) => {
   });
 });
 
-// ============ REAL IMPLEMENTATIONS ============
+// ============ FREE API - Hook to paid services ============
+
+// Free stats endpoint - gives useful info, promotes paid services
+app.get("/api/stats", async (req, res) => {
+  try {
+    // Get basic directory stats (free)
+    const totalAgents = await agentDirectory.count();
+    const recentNames = await agentDirectory.getAgentNames(Math.max(0, Number(totalAgents) - 5), 5);
+    
+    res.json({
+      agentDirectory: {
+        totalRegistered: Number(totalAgents),
+        recentRegistrations: [...recentNames].reverse(), // Most recent first
+        contract: AGENT_DIRECTORY_ADDRESS,
+        chain: IS_MAINNET ? "base" : "base-sepolia",
+        note: "For detailed agent info, use /api/agent-directory ($0.001) or /api/agent-directory/:name ($0.001)"
+      },
+      services: {
+        available: Object.keys(paidRoutes).length,
+        categories: ["directory", "reputation", "security", "weather"],
+        cheapest: "$0.001",
+        note: "All services accept USDC on Base via x402 protocol"
+      },
+      promotion: {
+        message: "🔐 New: Skill security scanning! Check any OpenClaw skill for vulnerabilities before installing.",
+        featured: {
+          endpoint: "POST /api/skill-audit",
+          price: "$0.05",
+          description: "Deep security audit of entire skill repositories"
+        }
+      },
+      queriedAt: new Date().toISOString(),
+      tip: "This endpoint is free. See /discovery for all available paid services."
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============ REAL IMPLEMENTATIONS (PAID) ============
 
 // Agent Directory - query the actual contract
 app.get("/api/agent-directory", async (req, res) => {
