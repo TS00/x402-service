@@ -684,16 +684,21 @@ app.get("/api/stats", async (req, res) => {
       },
       services: {
         available: Object.keys(paidRoutes).length,
-        categories: ["directory", "reputation", "security", "weather"],
+        categories: ["directory", "search", "reputation", "security", "weather", "discovery"],
         cheapest: "$0.001",
         note: "All services accept USDC on Base via x402 protocol"
       },
       promotion: {
-        message: "🔐 New: Skill security scanning! Check any OpenClaw skill for vulnerabilities before installing.",
+        message: "🔍 New: Cross-platform agent search! Find agents across Directory, Moltbook, Colony, GitHub, and more.",
         featured: {
-          endpoint: "POST /api/skill-audit",
-          price: "$0.05",
-          description: "Deep security audit of entire skill repositories"
+          endpoint: "GET /api/agent-search/:query",
+          price: "$0.005",
+          description: "Unified search across all major agent platforms"
+        },
+        alsoNew: {
+          endpoint: "POST /api/service-match",
+          price: "$0.008", 
+          description: "Find x402 services by describing what you need"
         }
       },
       queriedAt: new Date().toISOString(),
