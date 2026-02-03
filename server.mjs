@@ -461,6 +461,117 @@ const paidRoutes = {
         }
       })
     }
+  },
+  "GET /api/agent-search/:query": {
+    accepts: [{ scheme: "exact", price: "$0.005", network: NETWORK, payTo: PAY_TO }],
+    description: "Cross-platform agent discovery - search for agents across Agent Directory, Moltbook, Colony, MoltX, and GitHub. Returns unified profile with all known presences.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { query: "KitViolin" },
+        inputSchema: {
+          properties: {
+            query: { type: "string", description: "Agent name, handle, or wallet address to search for" }
+          },
+          required: ["query"]
+        },
+        output: {
+          example: {
+            query: "KitViolin",
+            found: true,
+            presences: {
+              agentDirectory: {
+                found: true,
+                name: "KitViolin",
+                wallet: "0x041613...",
+                platforms: ["moltbook", "x"],
+                registeredAt: 1706572800
+              },
+              moltbook: {
+                found: true,
+                profile: "https://moltbook.com/u/KitViolin",
+                status: "probed"
+              },
+              github: {
+                found: false,
+                profile: null
+              },
+              x: {
+                found: true,
+                handle: "@ts00x1",
+                status: "linked"
+              }
+            },
+            unifiedProfile: {
+              name: "KitViolin",
+              wallet: "0x041613...",
+              platforms: ["agentDirectory", "moltbook", "x"],
+              operator: "ts00",
+              onChain: true,
+              reputationScore: 72
+            },
+            searchedAt: "2026-02-03T18:00:00.000Z"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+              found: { type: "boolean" },
+              presences: { type: "object", description: "Status on each platform" },
+              unifiedProfile: { type: "object", description: "Consolidated agent profile" },
+              searchedAt: { type: "string" }
+            },
+            required: ["query", "found", "presences"]
+          }
+        }
+      })
+    }
+  },
+  "POST /api/service-match": {
+    accepts: [{ scheme: "exact", price: "$0.008", network: NETWORK, payTo: PAY_TO }],
+    description: "Find x402 services that match your needs. Describe what capability you need and get ranked service recommendations.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { need: "I need weather data for Halifax", maxResults: 5 },
+        inputSchema: {
+          properties: {
+            need: { type: "string", description: "Natural language description of what you need" },
+            maxResults: { type: "number", description: "Maximum services to return (default 5)", default: 5 },
+            maxPrice: { type: "string", description: "Maximum price per call (e.g. '$0.01')" }
+          },
+          required: ["need"]
+        },
+        bodyType: "json",
+        output: {
+          example: {
+            need: "I need weather data for Halifax",
+            matchedServices: [
+              {
+                name: "Kit's Weather Service",
+                endpoint: "GET /api/weather",
+                price: "$0.001",
+                url: "https://kit.ixxa.com/x402/api/weather?location=Halifax",
+                relevance: 0.95,
+                description: "Real-time weather data for any location"
+              }
+            ],
+            totalFound: 1,
+            searchedAt: "2026-02-03T18:00:00.000Z"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              need: { type: "string" },
+              matchedServices: { type: "array" },
+              totalFound: { type: "number" },
+              searchedAt: { type: "string" }
+            },
+            required: ["need", "matchedServices"]
+          }
+        }
+      })
+    }
   }
 };
 
@@ -1289,6 +1400,403 @@ app.get("/api/directory-analytics", async (req, res) => {
     });
   } catch (error) {
     console.error("Directory analytics error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Cross-Platform Agent Search
+app.get("/api/agent-search/:query", async (req, res) => {
+  try {
+    const query = req.params.query;
+    const presences = {};
+    let foundAny = false;
+    
+    // 1. Check Agent Directory (on-chain)
+    try {
+      const exists = await agentDirectory.nameExists(query);
+      if (exists) {
+        const agent = await agentDirectory.lookup(query);
+        presences.agentDirectory = {
+          found: true,
+          name: agent.agentName,
+          wallet: agent.registrant,
+          platforms: agent.platforms,
+          urls: agent.urls,
+          registeredAt: Number(agent.registeredAt),
+          lastSeen: Number(agent.lastSeen),
+          contract: AGENT_DIRECTORY_ADDRESS
+        };
+        foundAny = true;
+      } else {
+        // Try fuzzy match - search all names
+        const count = await agentDirectory.count();
+        const names = await agentDirectory.getAgentNames(0, Math.min(Number(count), 100));
+        const lowerQuery = query.toLowerCase();
+        const match = names.find(n => n.toLowerCase().includes(lowerQuery) || lowerQuery.includes(n.toLowerCase()));
+        if (match) {
+          const agent = await agentDirectory.lookup(match);
+          presences.agentDirectory = {
+            found: true,
+            name: agent.agentName,
+            wallet: agent.registrant,
+            platforms: agent.platforms,
+            urls: agent.urls,
+            registeredAt: Number(agent.registeredAt),
+            matchType: "fuzzy"
+          };
+          foundAny = true;
+        } else {
+          presences.agentDirectory = { found: false, searched: true };
+        }
+      }
+    } catch (e) {
+      presences.agentDirectory = { found: false, error: e.message };
+    }
+    
+    // 2. Probe Moltbook (if API available)
+    try {
+      const moltbookUrl = `https://moltbook.com/api/profiles/${encodeURIComponent(query)}`;
+      const moltbookResp = await fetch(moltbookUrl, { 
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(3000)
+      });
+      if (moltbookResp.ok) {
+        const moltData = await moltbookResp.json();
+        presences.moltbook = {
+          found: true,
+          profile: `https://moltbook.com/u/${query}`,
+          data: moltData
+        };
+        foundAny = true;
+      } else if (moltbookResp.status === 404) {
+        presences.moltbook = { found: false, searched: true };
+      } else {
+        // API might be down, just note the profile URL exists
+        presences.moltbook = { 
+          found: "unknown", 
+          profile: `https://moltbook.com/u/${query}`,
+          note: "API unavailable, profile URL may work"
+        };
+      }
+    } catch (e) {
+      presences.moltbook = { 
+        found: "unknown", 
+        profile: `https://moltbook.com/u/${query}`,
+        note: "Could not verify - " + (e.name === 'TimeoutError' ? 'timeout' : 'error')
+      };
+    }
+    
+    // 3. Check GitHub for user/org
+    try {
+      const ghUrl = `https://api.github.com/users/${encodeURIComponent(query)}`;
+      const ghResp = await fetch(ghUrl, {
+        headers: { 
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'Kit-Agent-Search/1.0'
+        },
+        signal: AbortSignal.timeout(3000)
+      });
+      if (ghResp.ok) {
+        const ghData = await ghResp.json();
+        presences.github = {
+          found: true,
+          profile: ghData.html_url,
+          type: ghData.type,
+          name: ghData.name,
+          bio: ghData.bio,
+          repos: ghData.public_repos,
+          followers: ghData.followers
+        };
+        foundAny = true;
+      } else {
+        presences.github = { found: false, searched: true };
+      }
+    } catch (e) {
+      presences.github = { found: false, error: e.message };
+    }
+    
+    // 4. Check The Colony
+    try {
+      const colonyUrl = `https://thecolony.cc/api/users/${encodeURIComponent(query)}`;
+      const colonyResp = await fetch(colonyUrl, {
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(3000)
+      });
+      if (colonyResp.ok) {
+        const colonyData = await colonyResp.json();
+        presences.colony = {
+          found: true,
+          profile: `https://thecolony.cc/u/${query}`,
+          data: colonyData
+        };
+        foundAny = true;
+      } else {
+        presences.colony = { found: false, searched: true };
+      }
+    } catch (e) {
+      presences.colony = { 
+        found: "unknown",
+        profile: `https://thecolony.cc/u/${query}`,
+        note: "Could not verify"
+      };
+    }
+    
+    // 5. Check MoltX
+    try {
+      presences.moltx = {
+        found: "unknown",
+        profile: `https://moltx.app/u/${query}`,
+        note: "Profile URL generated - verify manually"
+      };
+    } catch (e) {
+      presences.moltx = { found: false };
+    }
+    
+    // 6. Derive X/Twitter handle if in Agent Directory
+    if (presences.agentDirectory?.found && presences.agentDirectory.platforms) {
+      const xPlatformIndex = presences.agentDirectory.platforms.findIndex(p => 
+        p.toLowerCase() === 'x' || p.toLowerCase() === 'twitter'
+      );
+      if (xPlatformIndex >= 0 && presences.agentDirectory.urls?.[xPlatformIndex]) {
+        presences.x = {
+          found: true,
+          handle: presences.agentDirectory.urls[xPlatformIndex],
+          status: "linked"
+        };
+      }
+    }
+    
+    // Build unified profile
+    let unifiedProfile = null;
+    if (foundAny) {
+      unifiedProfile = {
+        name: presences.agentDirectory?.name || query,
+        wallet: presences.agentDirectory?.wallet || null,
+        platforms: Object.entries(presences)
+          .filter(([k, v]) => v.found === true)
+          .map(([k]) => k),
+        onChain: presences.agentDirectory?.found === true,
+        registeredAt: presences.agentDirectory?.registeredAt || null
+      };
+      
+      // Calculate simple presence score
+      const presenceScore = Object.values(presences).filter(p => p.found === true).length * 20;
+      unifiedProfile.presenceScore = Math.min(100, presenceScore);
+    }
+    
+    res.json({
+      query,
+      found: foundAny,
+      presences,
+      unifiedProfile,
+      platformsSearched: Object.keys(presences),
+      searchedAt: new Date().toISOString(),
+      provider: "Kit's Cross-Platform Agent Search v1.0"
+    });
+  } catch (error) {
+    console.error("Agent search error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Service Matching - Find x402 services by capability
+app.post("/api/service-match", async (req, res) => {
+  try {
+    const { need, maxResults = 5, maxPrice } = req.body;
+    
+    if (!need) {
+      return res.status(400).json({ error: "Provide 'need' - description of what you need" });
+    }
+    
+    // Known x402 service catalog (will expand over time)
+    const serviceCatalog = [
+      // My services
+      {
+        name: "Kit's Agent Directory",
+        provider: "Kit 🎻",
+        endpoint: "GET /api/agent-directory",
+        price: "$0.001",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["agents", "directory", "lookup", "registry", "identity"],
+        description: "Query the on-chain Agent Directory - find AI agents by name"
+      },
+      {
+        name: "Kit's Agent Lookup",
+        provider: "Kit 🎻",
+        endpoint: "GET /api/agent-directory/:name",
+        price: "$0.001",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["agents", "lookup", "identity", "profile"],
+        description: "Look up a specific AI agent by name"
+      },
+      {
+        name: "Kit's Weather Service",
+        provider: "Kit 🎻",
+        endpoint: "GET /api/weather",
+        price: "$0.001",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["weather", "climate", "forecast", "temperature", "conditions"],
+        description: "Real-time weather data for any location worldwide"
+      },
+      {
+        name: "Kit's Skill Scanner",
+        provider: "Kit 🎻",
+        endpoint: "POST /api/skill-scan",
+        price: "$0.01",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["security", "scan", "audit", "code", "skill", "vulnerabilities"],
+        description: "Security scan an OpenClaw skill for vulnerabilities"
+      },
+      {
+        name: "Kit's Skill Auditor",
+        provider: "Kit 🎻",
+        endpoint: "POST /api/skill-audit",
+        price: "$0.05",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["security", "audit", "code", "repository", "dependencies", "comprehensive"],
+        description: "Deep security audit of entire skill repositories"
+      },
+      {
+        name: "Kit's Reputation Service",
+        provider: "Kit 🎻",
+        endpoint: "GET /api/reputation/:name",
+        price: "$0.002",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["reputation", "trust", "agents", "verification", "score"],
+        description: "Aggregated reputation signals for AI agents"
+      },
+      {
+        name: "Kit's Directory Analytics",
+        provider: "Kit 🎻",
+        endpoint: "GET /api/directory-analytics",
+        price: "$0.003",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["analytics", "statistics", "agents", "directory", "growth"],
+        description: "Analytics and platform breakdown for the Agent Directory"
+      },
+      {
+        name: "Kit's Agent Search",
+        provider: "Kit 🎻",
+        endpoint: "GET /api/agent-search/:query",
+        price: "$0.005",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["search", "agents", "cross-platform", "discovery", "find"],
+        description: "Cross-platform agent discovery across multiple platforms"
+      },
+      // Known external services from x402 ecosystem
+      {
+        name: "auor.io Public Holidays",
+        provider: "auor.io",
+        endpoint: "GET /public-holidays",
+        price: "$0.001",
+        baseUrl: "https://auor.io",
+        categories: ["holidays", "calendar", "dates", "countries"],
+        description: "Public holiday data for any country"
+      },
+      {
+        name: "Zapper Token Balances",
+        provider: "Zapper",
+        endpoint: "GET /v2/balances",
+        price: "$0.01",
+        baseUrl: "https://api.zapper.xyz",
+        categories: ["defi", "tokens", "balances", "wallet", "crypto", "portfolio"],
+        description: "Token balances across multiple chains"
+      },
+      {
+        name: "Heurist Deep Research",
+        provider: "Heurist",
+        endpoint: "POST /research",
+        price: "$1.00",
+        baseUrl: "https://api.heurist.ai",
+        categories: ["research", "analysis", "deep", "comprehensive", "ai"],
+        description: "Deep AI-powered research on any topic"
+      },
+      {
+        name: "Browserbase Session",
+        provider: "Browserbase",
+        endpoint: "POST /sessions",
+        price: "$0.10",
+        baseUrl: "https://api.browserbase.com",
+        categories: ["browser", "automation", "scraping", "web", "headless"],
+        description: "Headless browser sessions for web automation"
+      },
+      {
+        name: "GenBase Image Generation",
+        provider: "GenBase",
+        endpoint: "POST /generate",
+        price: "$0.05",
+        baseUrl: "https://api.genbase.ai",
+        categories: ["image", "generation", "ai", "art", "visual", "picture"],
+        description: "AI image generation"
+      }
+    ];
+    
+    // Simple keyword matching (could be improved with embeddings)
+    const needLower = need.toLowerCase();
+    const needWords = needLower.split(/\s+/).filter(w => w.length > 2);
+    
+    // Score each service
+    const scoredServices = serviceCatalog.map(service => {
+      let score = 0;
+      
+      // Check category matches
+      for (const cat of service.categories) {
+        if (needLower.includes(cat)) score += 3;
+        for (const word of needWords) {
+          if (cat.includes(word) || word.includes(cat)) score += 1;
+        }
+      }
+      
+      // Check description matches
+      const descLower = service.description.toLowerCase();
+      for (const word of needWords) {
+        if (descLower.includes(word)) score += 2;
+      }
+      
+      // Check name matches
+      if (needLower.includes(service.name.toLowerCase())) score += 5;
+      
+      return { ...service, relevanceScore: score };
+    });
+    
+    // Filter by price if specified
+    let filteredServices = scoredServices;
+    if (maxPrice) {
+      const maxPriceNum = parseFloat(maxPrice.replace('$', ''));
+      filteredServices = scoredServices.filter(s => {
+        const priceNum = parseFloat(s.price.replace('$', ''));
+        return priceNum <= maxPriceNum;
+      });
+    }
+    
+    // Sort by score and take top results
+    const topServices = filteredServices
+      .filter(s => s.relevanceScore > 0)
+      .sort((a, b) => b.relevanceScore - a.relevanceScore)
+      .slice(0, maxResults)
+      .map(s => ({
+        name: s.name,
+        provider: s.provider,
+        endpoint: s.endpoint,
+        price: s.price,
+        url: s.baseUrl,
+        relevance: Math.min(1, s.relevanceScore / 10),
+        description: s.description,
+        categories: s.categories
+      }));
+    
+    res.json({
+      need,
+      matchedServices: topServices,
+      totalCatalogSize: serviceCatalog.length,
+      totalFound: topServices.length,
+      maxPriceFilter: maxPrice || null,
+      searchedAt: new Date().toISOString(),
+      provider: "Kit's Service Matcher v1.0",
+      note: "Catalog is growing - submit services to x402 Index for inclusion"
+    });
+  } catch (error) {
+    console.error("Service match error:", error);
     res.status(500).json({ error: error.message });
   }
 });
