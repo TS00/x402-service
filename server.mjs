@@ -9,9 +9,29 @@ import {
   bazaarResourceServerExtension,
   declareDiscoveryExtension,
 } from "@x402/extensions/bazaar";
-import { appendFileSync, existsSync, readFileSync } from "fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "fs";
+import Database from 'better-sqlite3';
 
 const app = express();
+
+// ============ AGENT MEMORY DATABASE ============
+const memoryDb = new Database('./agent-memory.db');
+
+// Initialize memory table
+memoryDb.exec(`
+  CREATE TABLE IF NOT EXISTS agent_memory (
+    namespace TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (namespace, key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_namespace ON agent_memory(namespace);
+`);
+
+console.log('   Memory DB: Initialized ✓');
 app.use(express.json());
 
 // ============ PAYMENT LOGGING ============
@@ -774,6 +794,102 @@ const paidRoutes = {
               rawLength: { type: "number" }
             },
             required: ["url", "fetchedAt", "type"]
+          }
+        }
+      })
+    }
+  },
+  
+  // ============ AGENT MEMORY API ============
+  "POST /api/memory/store": {
+    accepts: [{ scheme: "exact", price: "$0.002", network: NETWORK, payTo: PAY_TO }],
+    description: "Store a key-value pair in persistent memory. Each agent gets their own namespace (based on payer wallet). Max 10KB per value, 1000 keys per namespace.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { key: "my-data", value: { foo: "bar", count: 42 } },
+        inputSchema: {
+          properties: {
+            key: { type: "string", description: "Key name (alphanumeric, dashes, underscores)", maxLength: 100 },
+            value: { description: "Any JSON-serializable value (max 10KB)" },
+            namespace: { type: "string", description: "Optional namespace override (default: payer wallet)" }
+          },
+          required: ["key", "value"]
+        },
+        output: {
+          example: {
+            success: true,
+            namespace: "0x041613...",
+            key: "my-data",
+            size: 24,
+            created: false,
+            updatedAt: "2026-02-04T09:00:00.000Z"
+          }
+        }
+      })
+    }
+  },
+  "GET /api/memory/get/:namespace/:key": {
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "Retrieve a stored value by namespace and key.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { namespace: "0x041613...", key: "my-data" },
+        inputSchema: {
+          properties: {
+            namespace: { type: "string", description: "Namespace (usually wallet address)" },
+            key: { type: "string", description: "Key to retrieve" }
+          },
+          required: ["namespace", "key"]
+        },
+        output: {
+          example: {
+            namespace: "0x041613...",
+            key: "my-data",
+            value: { foo: "bar", count: 42 },
+            size: 24,
+            createdAt: "2026-02-04T09:00:00.000Z",
+            updatedAt: "2026-02-04T09:00:00.000Z"
+          }
+        }
+      })
+    }
+  },
+  "GET /api/memory/list/:namespace": {
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "List all keys stored in a namespace.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { namespace: "0x041613..." },
+        output: {
+          example: {
+            namespace: "0x041613...",
+            count: 3,
+            keys: [
+              { key: "my-data", size: 24, updatedAt: "2026-02-04T09:00:00.000Z" },
+              { key: "config", size: 156, updatedAt: "2026-02-04T08:00:00.000Z" }
+            ],
+            totalSize: 180
+          }
+        }
+      })
+    }
+  },
+  "DELETE /api/memory/delete/:namespace/:key": {
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "Delete a stored key-value pair.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { namespace: "0x041613...", key: "my-data" },
+        output: {
+          example: {
+            success: true,
+            deleted: true,
+            namespace: "0x041613...",
+            key: "my-data"
           }
         }
       })
@@ -2800,6 +2916,175 @@ app.get("/api/news-digest", async (req, res) => {
     
   } catch (error) {
     console.error("News digest error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============ AGENT MEMORY API ENDPOINTS ============
+
+const MEMORY_MAX_VALUE_SIZE = 10 * 1024; // 10KB max per value
+const MEMORY_MAX_KEYS_PER_NAMESPACE = 1000;
+
+// Validate key format
+function isValidKey(key) {
+  return /^[a-zA-Z0-9_-]{1,100}$/.test(key);
+}
+
+// Store endpoint
+app.post("/api/memory/store", async (req, res) => {
+  try {
+    const { key, value, namespace: customNamespace } = req.body;
+    
+    // Use provided namespace or default to "public"
+    // In production, x402 should provide payer wallet - we'd extract that
+    const namespace = customNamespace || "public";
+    
+    // Validate key
+    if (!key || !isValidKey(key)) {
+      return res.status(400).json({ 
+        error: "Invalid key. Must be 1-100 chars, alphanumeric with dashes and underscores only.",
+        pattern: "^[a-zA-Z0-9_-]{1,100}$"
+      });
+    }
+    
+    // Validate value exists
+    if (value === undefined) {
+      return res.status(400).json({ error: "Value is required" });
+    }
+    
+    // Serialize value
+    const serialized = JSON.stringify(value);
+    const size = serialized.length;
+    
+    // Check size limit
+    if (size > MEMORY_MAX_VALUE_SIZE) {
+      return res.status(400).json({ 
+        error: `Value too large. Max ${MEMORY_MAX_VALUE_SIZE} bytes, got ${size} bytes.` 
+      });
+    }
+    
+    // Check key count limit for this namespace
+    const keyCount = memoryDb.prepare(
+      'SELECT COUNT(*) as count FROM agent_memory WHERE namespace = ?'
+    ).get(namespace);
+    
+    const existingKey = memoryDb.prepare(
+      'SELECT 1 FROM agent_memory WHERE namespace = ? AND key = ?'
+    ).get(namespace, key);
+    
+    if (!existingKey && keyCount.count >= MEMORY_MAX_KEYS_PER_NAMESPACE) {
+      return res.status(400).json({ 
+        error: `Namespace full. Max ${MEMORY_MAX_KEYS_PER_NAMESPACE} keys per namespace.`,
+        currentCount: keyCount.count
+      });
+    }
+    
+    const now = Date.now();
+    const isCreate = !existingKey;
+    
+    // Upsert
+    memoryDb.prepare(`
+      INSERT INTO agent_memory (namespace, key, value, size, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(namespace, key) DO UPDATE SET
+        value = excluded.value,
+        size = excluded.size,
+        updated_at = excluded.updated_at
+    `).run(namespace, key, serialized, size, now, now);
+    
+    res.json({
+      success: true,
+      namespace,
+      key,
+      size,
+      created: isCreate,
+      updatedAt: new Date(now).toISOString()
+    });
+    
+  } catch (error) {
+    console.error("Memory store error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get endpoint
+app.get("/api/memory/get/:namespace/:key", async (req, res) => {
+  try {
+    const { namespace, key } = req.params;
+    
+    const row = memoryDb.prepare(
+      'SELECT value, size, created_at, updated_at FROM agent_memory WHERE namespace = ? AND key = ?'
+    ).get(namespace, key);
+    
+    if (!row) {
+      return res.status(404).json({ 
+        error: "Key not found",
+        namespace,
+        key
+      });
+    }
+    
+    res.json({
+      namespace,
+      key,
+      value: JSON.parse(row.value),
+      size: row.size,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString()
+    });
+    
+  } catch (error) {
+    console.error("Memory get error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List endpoint
+app.get("/api/memory/list/:namespace", async (req, res) => {
+  try {
+    const { namespace } = req.params;
+    
+    const rows = memoryDb.prepare(
+      'SELECT key, size, updated_at FROM agent_memory WHERE namespace = ? ORDER BY updated_at DESC'
+    ).all(namespace);
+    
+    const totalSize = rows.reduce((acc, row) => acc + row.size, 0);
+    
+    res.json({
+      namespace,
+      count: rows.length,
+      keys: rows.map(row => ({
+        key: row.key,
+        size: row.size,
+        updatedAt: new Date(row.updated_at).toISOString()
+      })),
+      totalSize
+    });
+    
+  } catch (error) {
+    console.error("Memory list error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete endpoint
+app.delete("/api/memory/delete/:namespace/:key", async (req, res) => {
+  try {
+    const { namespace, key } = req.params;
+    
+    const result = memoryDb.prepare(
+      'DELETE FROM agent_memory WHERE namespace = ? AND key = ?'
+    ).run(namespace, key);
+    
+    res.json({
+      success: true,
+      deleted: result.changes > 0,
+      namespace,
+      key
+    });
+    
+  } catch (error) {
+    console.error("Memory delete error:", error);
     res.status(500).json({ error: error.message });
   }
 });
