@@ -680,6 +680,66 @@ const paidRoutes = {
         }
       })
     }
+  },
+  "GET /api/summarize": {
+    accepts: [{ scheme: "exact", price: "$0.005", network: NETWORK, payTo: PAY_TO }],
+    description: "Extract and summarize content from any URL. Returns clean text, title, headings, and links. Perfect for agents that need to understand web pages without browser automation.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { url: "https://example.com/article", maxChars: 5000 },
+        inputSchema: {
+          properties: {
+            url: { type: "string", description: "URL to fetch and summarize (required)" },
+            maxChars: { type: "number", description: "Maximum characters to extract (default 5000)", default: 5000 }
+          },
+          required: ["url"]
+        },
+        output: {
+          example: {
+            url: "https://example.com/article",
+            fetchedAt: "2026-02-04T05:00:00Z",
+            type: "html",
+            title: "Example Article Title",
+            description: "Meta description of the article",
+            content: "The main text content extracted from the page...",
+            structure: {
+              headings: [{ level: 1, text: "Main Heading" }],
+              links: [{ href: "https://example.com/related", text: "Related Article" }]
+            },
+            stats: {
+              wordCount: 450,
+              estimatedReadingTimeMin: 3,
+              headingCount: 5,
+              linkCount: 8
+            },
+            provider: "Kit's URL Summarizer v1.0"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              fetchedAt: { type: "string" },
+              type: { type: "string", enum: ["html", "json", "text"] },
+              title: { type: "string" },
+              description: { type: "string" },
+              content: { type: "string", description: "Extracted text content" },
+              structure: { 
+                type: "object",
+                properties: {
+                  headings: { type: "array" },
+                  links: { type: "array" }
+                }
+              },
+              stats: { type: "object" },
+              truncated: { type: "boolean" },
+              rawLength: { type: "number" }
+            },
+            required: ["url", "fetchedAt", "type"]
+          }
+        }
+      })
+    }
   }
 };
 
@@ -757,7 +817,7 @@ app.get("/discovery", (req, res) => {
     operator: "Kit 🎻",
     operatorType: "ai-agent",
     description: "AI agent infrastructure services: Agent Directory queries, skill security scanning, weather data",
-    categories: ["ai", "agents", "security", "infrastructure", "weather"],
+    categories: ["ai", "agents", "security", "infrastructure", "weather", "content"],
     endpoints: Object.entries(paidRoutes).map(([route, config]) => ({
       route,
       price: config.accepts[0].price,
@@ -792,7 +852,7 @@ app.get("/api/stats", async (req, res) => {
       },
       services: {
         available: Object.keys(paidRoutes).length,
-        categories: ["directory", "search", "reputation", "security", "weather", "discovery"],
+        categories: ["directory", "search", "reputation", "security", "weather", "content"],
         cheapest: "$0.001",
         note: "All services accept USDC on Base via x402 protocol"
       },
@@ -2263,6 +2323,234 @@ app.post("/api/rpc-proxy", async (req, res) => {
       id: req.body?.id || 1,
       error: { code: -32603, message: error.message }
     });
+  }
+});
+
+// ============ URL SUMMARIZER - Extract and summarize web content ============
+
+async function fetchAndExtract(url, maxChars = 10000) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Kit-URL-Summarizer/1.0 (AI agent content extraction)',
+        'Accept': 'text/html,application/xhtml+xml,text/plain,application/json'
+      }
+    });
+    
+    clearTimeout(timeout);
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+    
+    const contentType = response.headers.get('content-type') || '';
+    const text = await response.text();
+    
+    // Handle JSON directly
+    if (contentType.includes('application/json')) {
+      return {
+        type: 'json',
+        content: text.substring(0, maxChars),
+        rawLength: text.length
+      };
+    }
+    
+    // Handle plain text
+    if (contentType.includes('text/plain')) {
+      return {
+        type: 'text',
+        content: text.substring(0, maxChars),
+        rawLength: text.length
+      };
+    }
+    
+    // Extract from HTML
+    let extracted = text;
+    
+    // Remove scripts and styles
+    extracted = extracted.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+    extracted = extracted.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
+    extracted = extracted.replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, '');
+    
+    // Extract title
+    const titleMatch = extracted.match(/<title[^>]*>([^<]*)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].trim() : null;
+    
+    // Extract meta description
+    const descMatch = extracted.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i) ||
+                      extracted.match(/<meta[^>]*content=["']([^"']+)["'][^>]*name=["']description["']/i);
+    const description = descMatch ? descMatch[1].trim() : null;
+    
+    // Extract og:title and og:description
+    const ogTitleMatch = extracted.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i);
+    const ogTitle = ogTitleMatch ? ogTitleMatch[1].trim() : null;
+    
+    const ogDescMatch = extracted.match(/<meta[^>]*property=["']og:description["'][^>]*content=["']([^"']+)["']/i);
+    const ogDescription = ogDescMatch ? ogDescMatch[1].trim() : null;
+    
+    // Extract main content areas
+    let mainContent = '';
+    
+    // Try to find main content areas
+    const mainPatterns = [
+      /<main[^>]*>([\s\S]*?)<\/main>/gi,
+      /<article[^>]*>([\s\S]*?)<\/article>/gi,
+      /<div[^>]*class="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/gi,
+      /<div[^>]*id="[^"]*content[^"]*"[^>]*>([\s\S]*?)<\/div>/gi
+    ];
+    
+    for (const pattern of mainPatterns) {
+      const matches = extracted.match(pattern);
+      if (matches && matches.length > 0) {
+        mainContent = matches.join('\n');
+        break;
+      }
+    }
+    
+    // Fallback to body content
+    if (!mainContent) {
+      const bodyMatch = extracted.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+      mainContent = bodyMatch ? bodyMatch[1] : extracted;
+    }
+    
+    // Clean up HTML
+    mainContent = mainContent
+      .replace(/<[^>]+>/g, ' ')  // Remove all HTML tags
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/\s+/g, ' ')  // Collapse whitespace
+      .trim();
+    
+    // Extract headings for structure
+    const headings = [];
+    const headingPattern = /<h([1-6])[^>]*>([^<]*)<\/h\1>/gi;
+    let match;
+    while ((match = headingPattern.exec(extracted)) !== null) {
+      const level = parseInt(match[1]);
+      const text = match[2].trim();
+      if (text) headings.push({ level, text });
+    }
+    
+    // Extract links
+    const links = [];
+    const linkPattern = /<a[^>]*href=["']([^"']+)["'][^>]*>([^<]*)<\/a>/gi;
+    while ((match = linkPattern.exec(extracted)) !== null && links.length < 10) {
+      const href = match[1];
+      const text = match[2].trim();
+      if (href && text && !href.startsWith('#') && !href.startsWith('javascript:')) {
+        links.push({ href, text });
+      }
+    }
+    
+    return {
+      type: 'html',
+      title: ogTitle || title,
+      description: ogDescription || description,
+      content: mainContent.substring(0, maxChars),
+      headings: headings.slice(0, 20),
+      links,
+      rawLength: text.length
+    };
+    
+  } catch (error) {
+    clearTimeout(timeout);
+    throw error;
+  }
+}
+
+app.get("/api/summarize", async (req, res) => {
+  try {
+    const { url, maxChars = 5000 } = req.query;
+    
+    if (!url) {
+      return res.status(400).json({ 
+        error: "Provide 'url' query parameter",
+        example: "GET /api/summarize?url=https://example.com"
+      });
+    }
+    
+    // Validate URL
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        return res.status(400).json({ error: "URL must use http or https protocol" });
+      }
+    } catch (e) {
+      return res.status(400).json({ error: "Invalid URL format" });
+    }
+    
+    // Block certain domains
+    const blockedDomains = ['localhost', '127.0.0.1', '0.0.0.0', '169.254.'];
+    if (blockedDomains.some(d => parsedUrl.hostname.includes(d))) {
+      return res.status(400).json({ error: "Cannot access local addresses" });
+    }
+    
+    const extracted = await fetchAndExtract(url, parseInt(maxChars));
+    
+    // Build response
+    const response = {
+      url,
+      fetchedAt: new Date().toISOString(),
+      type: extracted.type,
+      rawLength: extracted.rawLength,
+      truncated: extracted.content.length < extracted.rawLength
+    };
+    
+    if (extracted.type === 'json') {
+      response.json = JSON.parse(extracted.content);
+    } else if (extracted.type === 'text') {
+      response.text = extracted.content;
+    } else {
+      // HTML extracted content
+      response.title = extracted.title;
+      response.description = extracted.description;
+      response.content = extracted.content;
+      response.structure = {
+        headings: extracted.headings,
+        links: extracted.links
+      };
+      
+      // Generate quick summary stats
+      const words = extracted.content.split(/\s+/).length;
+      response.stats = {
+        wordCount: words,
+        estimatedReadingTimeMin: Math.ceil(words / 200),
+        headingCount: extracted.headings.length,
+        linkCount: extracted.links.length
+      };
+    }
+    
+    response.provider = "Kit's URL Summarizer v1.0";
+    
+    res.json(response);
+    
+  } catch (error) {
+    console.error("URL summarize error:", error);
+    
+    let statusCode = 500;
+    let errorMessage = error.message;
+    
+    if (error.name === 'AbortError') {
+      statusCode = 504;
+      errorMessage = "Request timed out - URL took too long to respond";
+    } else if (error.code === 'ENOTFOUND') {
+      statusCode = 400;
+      errorMessage = "Domain not found - check URL";
+    } else if (error.code === 'ECONNREFUSED') {
+      statusCode = 502;
+      errorMessage = "Connection refused by target server";
+    }
+    
+    res.status(statusCode).json({ error: errorMessage });
   }
 });
 
