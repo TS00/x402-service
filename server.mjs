@@ -89,14 +89,48 @@ const AGENT_DIRECTORY_ABI = [
   "function nameExists(string) view returns (bool)"
 ];
 
-// Base RPC - llamarpc is more reliable than mainnet.base.org
-const BASE_RPC = IS_MAINNET 
-  ? "https://base.llamarpc.com"
-  : "https://sepolia.base.org";
+// RPC endpoints for failover (order matters - try fastest first)
+const DIRECTORY_RPC_ENDPOINTS = IS_MAINNET ? [
+  "https://base.llamarpc.com",
+  "https://mainnet.base.org",
+  "https://base.publicnode.com",
+  "https://1rpc.io/base"
+] : ["https://sepolia.base.org"];
 
-const provider = new ethers.JsonRpcProvider(BASE_RPC, IS_MAINNET ? 8453 : 84532);
-const agentDirectory = new ethers.Contract(AGENT_DIRECTORY_ADDRESS, AGENT_DIRECTORY_ABI, provider);
-console.log(`   RPC: ${BASE_RPC}`);
+// Track which endpoints are rate-limited
+const rpcRateLimited = {};
+
+// Get a working provider with failover
+async function getWorkingProvider() {
+  for (const rpcUrl of DIRECTORY_RPC_ENDPOINTS) {
+    // Skip if rate-limited
+    if (rpcRateLimited[rpcUrl] && rpcRateLimited[rpcUrl] > Date.now()) {
+      continue;
+    }
+    
+    try {
+      const provider = new ethers.JsonRpcProvider(rpcUrl, IS_MAINNET ? 8453 : 84532);
+      // Quick test
+      await provider.getBlockNumber();
+      return provider;
+    } catch (e) {
+      if (e.message?.includes('429') || e.message?.includes('rate')) {
+        rpcRateLimited[rpcUrl] = Date.now() + 30000; // 30s cooldown
+      }
+    }
+  }
+  throw new Error("All RPC endpoints exhausted");
+}
+
+// Get directory contract with working provider
+async function getDirectoryContract() {
+  const provider = await getWorkingProvider();
+  return new ethers.Contract(AGENT_DIRECTORY_ADDRESS, AGENT_DIRECTORY_ABI, provider);
+}
+
+// Default provider for startup logging
+const provider = new ethers.JsonRpcProvider(DIRECTORY_RPC_ENDPOINTS[0], IS_MAINNET ? 8453 : 84532);
+console.log(`   RPC: ${DIRECTORY_RPC_ENDPOINTS[0]} (with failover to ${DIRECTORY_RPC_ENDPOINTS.length - 1} others)`);
 
 console.log(`🎻 Kit's x402 Service`);
 console.log(`   Mode: ${IS_MAINNET ? "MAINNET (Base)" : "TESTNET (Base Sepolia)"}`);
@@ -993,8 +1027,9 @@ app.get("/discovery", (req, res) => {
 app.get("/api/stats", async (req, res) => {
   try {
     // Get basic directory stats (free)
-    const totalAgents = await agentDirectory.count();
-    const recentNames = await agentDirectory.getAgentNames(Math.max(0, Number(totalAgents) - 5), 5);
+    const directory = await getDirectoryContract();
+    const totalAgents = await directory.count();
+    const recentNames = await directory.getAgentNames(Math.max(0, Number(totalAgents) - 5), 5);
     
     res.json({
       agentDirectory: {
@@ -1036,16 +1071,17 @@ app.get("/api/stats", async (req, res) => {
 // Agent Directory - query the actual contract
 app.get("/api/agent-directory", async (req, res) => {
   try {
-    const totalCount = await agentDirectory.count();
+    const directory = await getDirectoryContract();
+    const totalCount = await directory.count();
     const agents = [];
     
     // Fetch up to 50 agents using batch names
     const limit = Math.min(Number(totalCount), 50);
-    const names = await agentDirectory.getAgentNames(0, limit);
+    const names = await directory.getAgentNames(0, limit);
     
     for (let i = 0; i < names.length; i++) {
       try {
-        const result = await agentDirectory.lookup(names[i]);
+        const result = await directory.lookup(names[i]);
         agents.push({
           id: i + 1,
           name: result.agentName,
@@ -1078,13 +1114,14 @@ app.get("/api/agent-directory", async (req, res) => {
 // Agent lookup by name
 app.get("/api/agent-directory/:name", async (req, res) => {
   try {
+    const directory = await getDirectoryContract();
     // Check if agent exists first
-    const exists = await agentDirectory.nameExists(req.params.name);
+    const exists = await directory.nameExists(req.params.name);
     if (!exists) {
       return res.status(404).json({ error: "Agent not found", name: req.params.name });
     }
     
-    const result = await agentDirectory.lookup(req.params.name);
+    const result = await directory.lookup(req.params.name);
     
     res.json({
       name: result.agentName,
@@ -1105,9 +1142,10 @@ app.get("/api/agent-directory/:name", async (req, res) => {
 app.get("/api/reputation/:name", async (req, res) => {
   try {
     const agentName = req.params.name;
+    const directory = await getDirectoryContract();
     
     // Step 1: Check if agent exists
-    const exists = await agentDirectory.nameExists(agentName);
+    const exists = await directory.nameExists(agentName);
     if (!exists) {
       return res.status(404).json({ 
         error: "Agent not found in directory", 
@@ -1117,7 +1155,7 @@ app.get("/api/reputation/:name", async (req, res) => {
     }
     
     // Step 2: Look up agent in directory
-    const agent = await agentDirectory.lookup(agentName);
+    const agent = await directory.lookup(agentName);
     
     // Step 3: Calculate age since registration
     const registeredAt = Number(agent.registeredAt);
@@ -1630,12 +1668,13 @@ app.post("/api/skill-audit", async (req, res) => {
 // Directory Analytics - platform breakdown and growth metrics
 app.get("/api/directory-analytics", async (req, res) => {
   try {
+    const directory = await getDirectoryContract();
     const now = Date.now() / 1000;
     const oneWeekAgo = now - (7 * 24 * 60 * 60);
     const oneMonthAgo = now - (30 * 24 * 60 * 60);
     
     // Get total count
-    const count = await agentDirectory.count();
+    const count = await directory.count();
     const totalAgents = Number(count);
     
     if (totalAgents === 0) {
@@ -1651,13 +1690,13 @@ app.get("/api/directory-analytics", async (req, res) => {
     }
     
     // Fetch all agent names
-    const names = await agentDirectory.getAgentNames(0, totalAgents);
+    const names = await directory.getAgentNames(0, totalAgents);
     
     // Fetch details for each agent
     const agents = [];
     for (const name of names) {
       try {
-        const agent = await agentDirectory.lookup(name);
+        const agent = await directory.lookup(name);
         agents.push({
           name: agent.agentName,
           platforms: agent.platforms,
@@ -1740,9 +1779,10 @@ app.get("/api/agent-search/:query", async (req, res) => {
     
     // 1. Check Agent Directory (on-chain)
     try {
-      const exists = await agentDirectory.nameExists(query);
+      const directory = await getDirectoryContract();
+      const exists = await directory.nameExists(query);
       if (exists) {
-        const agent = await agentDirectory.lookup(query);
+        const agent = await directory.lookup(query);
         presences.agentDirectory = {
           found: true,
           name: agent.agentName,
@@ -1756,12 +1796,12 @@ app.get("/api/agent-search/:query", async (req, res) => {
         foundAny = true;
       } else {
         // Try fuzzy match - search all names
-        const count = await agentDirectory.count();
-        const names = await agentDirectory.getAgentNames(0, Math.min(Number(count), 100));
+        const count = await directory.count();
+        const names = await directory.getAgentNames(0, Math.min(Number(count), 100));
         const lowerQuery = query.toLowerCase();
         const match = names.find(n => n.toLowerCase().includes(lowerQuery) || lowerQuery.includes(n.toLowerCase()));
         if (match) {
-          const agent = await agentDirectory.lookup(match);
+          const agent = await directory.lookup(match);
           presences.agentDirectory = {
             found: true,
             name: agent.agentName,
@@ -2744,9 +2784,10 @@ app.get("/api/news-digest", async (req, res) => {
     // 1. Agent Directory - Recent registrations
     sources.push((async () => {
       try {
-        const totalAgents = await agentDirectory.count();
+        const directory = await getDirectoryContract();
+        const totalAgents = await directory.count();
         const recentCount = Math.min(10, Number(totalAgents));
-        const recentNames = await agentDirectory.getAgentNames(
+        const recentNames = await directory.getAgentNames(
           Math.max(0, Number(totalAgents) - recentCount), 
           recentCount
         );
@@ -2755,7 +2796,7 @@ app.get("/api/news-digest", async (req, res) => {
         const recentAgents = [];
         for (const name of [...recentNames].reverse().slice(0, 5)) {
           try {
-            const agent = await agentDirectory.lookup(name);
+            const agent = await directory.lookup(name);
             recentAgents.push({
               name,
               platforms: agent.platforms || [],
