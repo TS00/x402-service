@@ -572,6 +572,56 @@ const paidRoutes = {
         }
       })
     }
+  },
+  "POST /api/service-probe": {
+    accepts: [{ scheme: "exact", price: "$0.002", network: NETWORK, payTo: PAY_TO }],
+    description: "Probe an x402 service endpoint to check if it's alive and accepting payments before you commit. Returns health status, latency, and payment requirements.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { url: "https://example.com/api/endpoint" },
+        inputSchema: {
+          properties: {
+            url: { type: "string", description: "Full URL of the x402 service endpoint to probe" },
+            method: { type: "string", description: "HTTP method (GET or POST)", default: "GET" },
+            timeout: { type: "number", description: "Timeout in ms (default 5000)", default: 5000 }
+          },
+          required: ["url"]
+        },
+        bodyType: "json",
+        output: {
+          example: {
+            url: "https://kit.ixxa.com/x402/api/weather",
+            alive: true,
+            acceptsX402: true,
+            status: 402,
+            latencyMs: 145,
+            paymentInfo: {
+              price: "$0.001",
+              network: "eip155:8453",
+              payTo: "0x041613Fdd87a4eA14c9409d84489BF348947e360"
+            },
+            probedAt: "2026-02-04T01:00:00.000Z",
+            recommendation: "Service is healthy and ready to accept payment"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              alive: { type: "boolean", description: "Whether the service responded at all" },
+              acceptsX402: { type: "boolean", description: "Whether it returned 402 with payment headers" },
+              status: { type: "number", description: "HTTP status code returned" },
+              latencyMs: { type: "number", description: "Response time in milliseconds" },
+              paymentInfo: { type: "object", description: "Extracted x402 payment requirements" },
+              error: { type: "string", description: "Error message if probe failed" },
+              probedAt: { type: "string" },
+              recommendation: { type: "string" }
+            },
+            required: ["url", "alive", "probedAt"]
+          }
+        }
+      })
+    }
   }
 };
 
@@ -1802,6 +1852,173 @@ app.post("/api/service-match", async (req, res) => {
     });
   } catch (error) {
     console.error("Service match error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Service Prober - check if x402 services are alive before paying
+app.post("/api/service-probe", async (req, res) => {
+  try {
+    const { url, method = "GET", timeout = 5000 } = req.body;
+    
+    if (!url) {
+      return res.status(400).json({ error: "Provide 'url' - the x402 service endpoint to probe" });
+    }
+    
+    // Validate URL
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+      if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+        return res.status(400).json({ error: "URL must use http or https protocol" });
+      }
+    } catch (e) {
+      return res.status(400).json({ error: "Invalid URL format" });
+    }
+    
+    const result = {
+      url,
+      alive: false,
+      acceptsX402: false,
+      status: null,
+      latencyMs: null,
+      paymentInfo: null,
+      error: null,
+      headers: {},
+      probedAt: new Date().toISOString(),
+      recommendation: null
+    };
+    
+    const startTime = Date.now();
+    
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      
+      // Make the probe request
+      const response = await fetch(url, {
+        method: method.toUpperCase(),
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Kit-Service-Prober/1.0 (x402 health check)'
+        },
+        signal: controller.signal,
+        // For POST, send minimal body
+        ...(method.toUpperCase() === 'POST' ? { body: JSON.stringify({}) } : {})
+      });
+      
+      clearTimeout(timeoutId);
+      
+      result.latencyMs = Date.now() - startTime;
+      result.status = response.status;
+      result.alive = true;
+      
+      // Extract relevant headers
+      const relevantHeaders = ['x-payment', 'x-payment-required', 'www-authenticate', 'content-type'];
+      for (const header of relevantHeaders) {
+        const value = response.headers.get(header);
+        if (value) result.headers[header] = value;
+      }
+      
+      // Check for x402 payment response
+      if (response.status === 402) {
+        result.acceptsX402 = true;
+        
+        // Try to extract payment info from headers or body
+        const paymentHeader = response.headers.get('x-payment') || response.headers.get('x-payment-required');
+        
+        if (paymentHeader) {
+          try {
+            // Payment header might be JSON or base64
+            let paymentData;
+            if (paymentHeader.startsWith('{')) {
+              paymentData = JSON.parse(paymentHeader);
+            } else if (paymentHeader.startsWith('ey')) {
+              // Looks like base64/JWT
+              const decoded = Buffer.from(paymentHeader.split('.')[1] || paymentHeader, 'base64').toString();
+              paymentData = JSON.parse(decoded);
+            }
+            if (paymentData) {
+              result.paymentInfo = {
+                price: paymentData.price || paymentData.maxAmountRequired,
+                network: paymentData.network,
+                payTo: paymentData.payTo || paymentData.payee,
+                scheme: paymentData.scheme
+              };
+            }
+          } catch (e) {
+            // Could not parse payment header
+            result.paymentInfo = { raw: paymentHeader.substring(0, 200) };
+          }
+        }
+        
+        // Also try to get info from response body
+        try {
+          const bodyText = await response.text();
+          if (bodyText && bodyText.startsWith('{')) {
+            const bodyData = JSON.parse(bodyText);
+            if (bodyData.accepts || bodyData.payment || bodyData.price) {
+              result.paymentInfo = result.paymentInfo || {};
+              if (bodyData.accepts && bodyData.accepts[0]) {
+                result.paymentInfo.price = bodyData.accepts[0].maxAmountRequired || bodyData.accepts[0].price;
+                result.paymentInfo.network = bodyData.accepts[0].network;
+                result.paymentInfo.payTo = bodyData.accepts[0].payTo;
+                result.paymentInfo.scheme = bodyData.accepts[0].scheme;
+              }
+            }
+          }
+        } catch (e) {
+          // Could not parse body
+        }
+        
+        result.recommendation = "Service is healthy and accepting x402 payments";
+        
+      } else if (response.status >= 200 && response.status < 300) {
+        // Service responded successfully without requiring payment
+        result.recommendation = "Service responded OK - may be free or using different auth";
+        
+      } else if (response.status === 401 || response.status === 403) {
+        result.recommendation = "Service requires authentication (not x402)";
+        
+      } else if (response.status >= 500) {
+        result.recommendation = "Service is experiencing server errors - wait and retry";
+        
+      } else if (response.status === 404) {
+        result.recommendation = "Endpoint not found - check URL";
+        
+      } else {
+        result.recommendation = `Unexpected status ${response.status} - verify endpoint`;
+      }
+      
+    } catch (e) {
+      result.latencyMs = Date.now() - startTime;
+      
+      if (e.name === 'AbortError') {
+        result.error = `Timeout after ${timeout}ms`;
+        result.recommendation = "Service did not respond in time - may be down or overloaded";
+      } else if (e.code === 'ECONNREFUSED') {
+        result.error = "Connection refused";
+        result.recommendation = "Service is not accepting connections - likely down";
+      } else if (e.code === 'ENOTFOUND') {
+        result.error = "DNS lookup failed";
+        result.recommendation = "Domain does not resolve - check URL";
+      } else {
+        result.error = e.message;
+        result.recommendation = "Probe failed - service may be down or misconfigured";
+      }
+    }
+    
+    // Add summary
+    result.summary = result.alive && result.acceptsX402 
+      ? "✅ Ready" 
+      : result.alive 
+        ? "⚠️ Alive but not standard x402" 
+        : "❌ Unreachable";
+    
+    res.json(result);
+    
+  } catch (error) {
+    console.error("Service probe error:", error);
     res.status(500).json({ error: error.message });
   }
 });
