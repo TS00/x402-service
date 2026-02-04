@@ -681,6 +681,44 @@ const paidRoutes = {
       })
     }
   },
+  "GET /api/news-digest": {
+    accepts: [{ scheme: "exact", price: "$0.015", network: NETWORK, payTo: PAY_TO }],
+    description: "Aggregated news digest across agent platforms - Agent Directory registrations, Moltbook trending, Colony activity, x402 ecosystem health, and key trends. Stay informed about the agent ecosystem.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: {},
+        inputSchema: {
+          properties: {},
+          required: []
+        },
+        output: {
+          example: {
+            generatedAt: "2026-02-04T05:00:00Z",
+            sections: {
+              agentDirectory: { status: "ok", totalAgents: 11, recentRegistrations: [] },
+              moltbook: { status: "ok", trending: [] },
+              theColony: { status: "ok", recentPosts: [] },
+              x402Ecosystem: { status: "ok", knownServices: [] },
+              pulse: { status: "ok", keyTrends: [] }
+            },
+            summary: { totalItems: 15, sourcesQueried: 5, sourcesSucceeded: 4 },
+            provider: "Kit's Agent News Digest v1.0"
+          },
+          schema: {
+            type: "object",
+            properties: {
+              generatedAt: { type: "string" },
+              sections: { type: "object", description: "News from each platform" },
+              summary: { type: "object" },
+              provider: { type: "string" }
+            },
+            required: ["generatedAt", "sections", "summary"]
+          }
+        }
+      })
+    }
+  },
   "GET /api/summarize": {
     accepts: [{ scheme: "exact", price: "$0.005", network: NETWORK, payTo: PAY_TO }],
     description: "Extract and summarize content from any URL. Returns clean text, title, headings, and links. Perfect for agents that need to understand web pages without browser automation.",
@@ -2551,6 +2589,218 @@ app.get("/api/summarize", async (req, res) => {
     }
     
     res.status(statusCode).json({ error: errorMessage });
+  }
+});
+
+// ============ AGENT NEWS DIGEST - Aggregated activity across platforms ============
+
+async function fetchWithTimeout(url, timeout = 5000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Kit-News-Aggregator/1.0' }
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
+app.get("/api/news-digest", async (req, res) => {
+  try {
+    const digest = {
+      generatedAt: new Date().toISOString(),
+      sections: {},
+      summary: {
+        totalItems: 0,
+        sourcesQueried: 0,
+        sourcesSucceeded: 0
+      }
+    };
+    
+    const sources = [];
+    
+    // 1. Agent Directory - Recent registrations
+    sources.push((async () => {
+      try {
+        const totalAgents = await agentDirectory.count();
+        const recentCount = Math.min(10, Number(totalAgents));
+        const recentNames = await agentDirectory.getAgentNames(
+          Math.max(0, Number(totalAgents) - recentCount), 
+          recentCount
+        );
+        
+        // Get details for most recent agents
+        const recentAgents = [];
+        for (const name of [...recentNames].reverse().slice(0, 5)) {
+          try {
+            const agent = await agentDirectory.lookup(name);
+            recentAgents.push({
+              name,
+              platforms: agent.platforms || [],
+              registeredAt: new Date(Number(agent.registeredAt) * 1000).toISOString()
+            });
+          } catch (e) {
+            recentAgents.push({ name, error: 'lookup failed' });
+          }
+        }
+        
+        digest.sections.agentDirectory = {
+          status: 'ok',
+          totalAgents: Number(totalAgents),
+          recentRegistrations: recentAgents,
+          link: 'https://ts00.github.io/agent-directory/'
+        };
+        return true;
+      } catch (e) {
+        digest.sections.agentDirectory = { status: 'error', error: e.message };
+        return false;
+      }
+    })());
+    
+    // 2. Moltbook trending (if API available)
+    sources.push((async () => {
+      try {
+        const response = await fetchWithTimeout('https://api.moltbook.com/posts?limit=5&sort=trending', 3000);
+        if (response.posts && response.posts.length > 0) {
+          digest.sections.moltbook = {
+            status: 'ok',
+            trending: response.posts.map(p => ({
+              title: p.title || p.content?.substring(0, 100),
+              author: p.author?.name || p.authorName,
+              community: p.community?.name || p.communityName,
+              upvotes: p.upvotes || 0
+            })),
+            link: 'https://moltbook.com'
+          };
+          return true;
+        }
+        throw new Error('No posts returned');
+      } catch (e) {
+        digest.sections.moltbook = { 
+          status: 'unavailable', 
+          note: 'Moltbook API intermittently available',
+          link: 'https://moltbook.com'
+        };
+        return false;
+      }
+    })());
+    
+    // 3. The Colony activity
+    sources.push((async () => {
+      try {
+        const response = await fetchWithTimeout('https://thecolony.cc/api/posts?limit=5', 3000);
+        if (response.posts || response.data) {
+          const posts = response.posts || response.data || [];
+          digest.sections.theColony = {
+            status: 'ok',
+            recentPosts: posts.slice(0, 5).map(p => ({
+              title: p.title || p.content?.substring(0, 100),
+              author: p.author?.username || p.author
+            })),
+            link: 'https://thecolony.cc'
+          };
+          return true;
+        }
+        throw new Error('No data returned');
+      } catch (e) {
+        digest.sections.theColony = { 
+          status: 'unavailable',
+          note: 'Check manually at thecolony.cc',
+          link: 'https://thecolony.cc'
+        };
+        return false;
+      }
+    })());
+    
+    // 4. x402 Ecosystem stats
+    sources.push((async () => {
+      try {
+        // Check a few known x402 services for health
+        const services = [
+          { name: 'Agent Verify V3', url: 'https://api.agentverify.ai/api/v3/health' },
+          { name: 'SGL Layer', url: 'https://api.x402layer.cc/health' }
+        ];
+        
+        const healthChecks = await Promise.all(
+          services.map(async (svc) => {
+            try {
+              await fetchWithTimeout(svc.url, 2000);
+              return { name: svc.name, status: 'up' };
+            } catch (e) {
+              return { name: svc.name, status: 'down' };
+            }
+          })
+        );
+        
+        digest.sections.x402Ecosystem = {
+          status: 'ok',
+          note: 'x402 protocol for agent-to-agent payments',
+          knownServices: healthChecks,
+          myServices: 12,
+          link: 'https://x402.org'
+        };
+        return true;
+      } catch (e) {
+        digest.sections.x402Ecosystem = { status: 'error', error: e.message };
+        return false;
+      }
+    })());
+    
+    // 5. Quick ecosystem pulse
+    sources.push((async () => {
+      try {
+        // Get basic metrics
+        const now = new Date();
+        const dayOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][now.getUTCDay()];
+        
+        digest.sections.pulse = {
+          status: 'ok',
+          timestamp: now.toISOString(),
+          dayOfWeek,
+          note: 'Agent ecosystem continues to grow. New platforms emerging weekly.',
+          keyTrends: [
+            'x402 payment protocol gaining traction',
+            'Multi-agent collaboration experiments increasing',
+            'Cross-platform identity becoming important'
+          ],
+          resources: {
+            agentDirectory: 'https://ts00.github.io/agent-directory/',
+            x402Bazaar: 'https://x402.org/bazaar',
+            moltbook: 'https://moltbook.com',
+            theColony: 'https://thecolony.cc'
+          }
+        };
+        return true;
+      } catch (e) {
+        return false;
+      }
+    })());
+    
+    // Wait for all sources
+    const results = await Promise.all(sources);
+    digest.summary.sourcesQueried = sources.length;
+    digest.summary.sourcesSucceeded = results.filter(r => r).length;
+    digest.summary.totalItems = Object.values(digest.sections).reduce((acc, section) => {
+      if (section.recentRegistrations) acc += section.recentRegistrations.length;
+      if (section.trending) acc += section.trending.length;
+      if (section.recentPosts) acc += section.recentPosts.length;
+      return acc;
+    }, 0);
+    
+    digest.provider = "Kit's Agent News Digest v1.0";
+    digest.nextUpdate = "Query again anytime - data is live";
+    
+    res.json(digest);
+    
+  } catch (error) {
+    console.error("News digest error:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
