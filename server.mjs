@@ -1738,6 +1738,24 @@ app.post("/api/service-match", async (req, res) => {
         categories: ["search", "agents", "cross-platform", "discovery", "find"],
         description: "Cross-platform agent discovery across multiple platforms"
       },
+      {
+        name: "Kit's Service Match",
+        provider: "Kit 🎻",
+        endpoint: "POST /api/service-match",
+        price: "$0.008",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["search", "services", "x402", "find", "capability", "match"],
+        description: "Find x402 services by describing what you need"
+      },
+      {
+        name: "Kit's Service Prober",
+        provider: "Kit 🎻",
+        endpoint: "POST /api/service-probe",
+        price: "$0.002",
+        baseUrl: "https://kit.ixxa.com/x402",
+        categories: ["health", "probe", "check", "x402", "alive", "status", "verify", "uptime"],
+        description: "Check if an x402 service is alive before paying - returns health status and latency"
+      },
       // Known external services from x402 ecosystem
       {
         name: "auor.io Public Holidays",
