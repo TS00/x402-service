@@ -622,6 +622,64 @@ const paidRoutes = {
         }
       })
     }
+  },
+  "POST /api/rpc-proxy": {
+    accepts: [{ scheme: "exact", price: "$0.001", network: NETWORK, payTo: PAY_TO }],
+    description: "Reliable Base mainnet RPC proxy with automatic failover across multiple endpoints. Handles rate limiting and retries transparently. Supports all standard JSON-RPC methods.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        input: { 
+          jsonrpc: "2.0",
+          method: "eth_blockNumber",
+          params: [],
+          id: 1
+        },
+        inputSchema: {
+          properties: {
+            jsonrpc: { type: "string", description: "JSON-RPC version (always '2.0')", default: "2.0" },
+            method: { type: "string", description: "RPC method (eth_blockNumber, eth_call, eth_getBalance, etc.)" },
+            params: { type: "array", description: "Method parameters" },
+            id: { type: "number", description: "Request ID" }
+          },
+          required: ["method"]
+        },
+        bodyType: "json",
+        output: {
+          example: {
+            jsonrpc: "2.0",
+            id: 1,
+            result: "0x12345678",
+            _meta: {
+              rpcUsed: "base.llamarpc.com",
+              latencyMs: 89,
+              cachedResult: false,
+              retries: 0
+            }
+          },
+          schema: {
+            type: "object",
+            properties: {
+              jsonrpc: { type: "string" },
+              id: { type: "number" },
+              result: { description: "RPC result (type varies by method)" },
+              error: { type: "object", description: "RPC error if failed" },
+              _meta: { 
+                type: "object", 
+                description: "Proxy metadata (which RPC used, latency, etc.)",
+                properties: {
+                  rpcUsed: { type: "string" },
+                  latencyMs: { type: "number" },
+                  cachedResult: { type: "boolean" },
+                  retries: { type: "number" }
+                }
+              }
+            },
+            required: ["jsonrpc"]
+          }
+        }
+      })
+    }
   }
 };
 
@@ -2038,6 +2096,173 @@ app.post("/api/service-probe", async (req, res) => {
   } catch (error) {
     console.error("Service probe error:", error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ============ RPC PROXY - Reliable Base RPC with failover ============
+
+// RPC endpoints with rate limit tracking
+const RPC_ENDPOINTS = [
+  { url: "https://mainnet.base.org", name: "base-mainnet", rateLimitedUntil: 0 },
+  { url: "https://base.publicnode.com", name: "base-publicnode", rateLimitedUntil: 0 },
+  { url: "https://1rpc.io/base", name: "1rpc", rateLimitedUntil: 0 },
+  { url: "https://base.llamarpc.com", name: "llamarpc", rateLimitedUntil: 0 },
+  { url: "https://base-rpc.publicnode.com", name: "publicnode-alt", rateLimitedUntil: 0 }
+];
+
+// Simple cache for read-only calls (blockNumber, chainId, etc.)
+const rpcCache = new Map();
+const CACHE_TTL_MS = 3000; // 3 seconds
+
+function getCacheKey(method, params) {
+  // Only cache certain read-only methods
+  const cacheable = ['eth_blockNumber', 'eth_chainId', 'net_version', 'eth_gasPrice'];
+  if (!cacheable.includes(method)) return null;
+  return `${method}:${JSON.stringify(params || [])}`;
+}
+
+async function tryRpcEndpoint(endpoint, body, timeout = 8000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const response = await fetch(endpoint.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (response.status === 429 || response.status === 503 || response.status === 1015) {
+      // Rate limited - mark this endpoint as unavailable for 30s
+      endpoint.rateLimitedUntil = Date.now() + 30000;
+      throw new Error(`Rate limited (${response.status})`);
+    }
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const data = await response.json();
+    
+    // Check for RPC-level rate limit errors
+    if (data.error && (data.error.code === -32005 || data.error.message?.includes('rate limit'))) {
+      endpoint.rateLimitedUntil = Date.now() + 30000;
+      throw new Error('RPC rate limited');
+    }
+    
+    return data;
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
+app.post("/api/rpc-proxy", async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    const { jsonrpc = "2.0", method, params = [], id = 1 } = req.body;
+    
+    if (!method) {
+      return res.status(400).json({ 
+        jsonrpc: "2.0", 
+        id, 
+        error: { code: -32600, message: "Invalid Request: method required" }
+      });
+    }
+    
+    // Check cache first
+    const cacheKey = getCacheKey(method, params);
+    if (cacheKey) {
+      const cached = rpcCache.get(cacheKey);
+      if (cached && cached.expiresAt > Date.now()) {
+        return res.json({
+          jsonrpc: "2.0",
+          id,
+          result: cached.result,
+          _meta: {
+            rpcUsed: "cache",
+            latencyMs: Date.now() - startTime,
+            cachedResult: true,
+            retries: 0
+          }
+        });
+      }
+    }
+    
+    const rpcBody = { jsonrpc, method, params, id };
+    let lastError = null;
+    let retries = 0;
+    
+    // Try each endpoint in order, skipping rate-limited ones
+    for (const endpoint of RPC_ENDPOINTS) {
+      // Skip if currently rate limited
+      if (endpoint.rateLimitedUntil > Date.now()) {
+        continue;
+      }
+      
+      try {
+        const result = await tryRpcEndpoint(endpoint, rpcBody);
+        
+        // Cache successful cacheable results
+        if (cacheKey && result.result !== undefined && !result.error) {
+          rpcCache.set(cacheKey, {
+            result: result.result,
+            expiresAt: Date.now() + CACHE_TTL_MS
+          });
+        }
+        
+        return res.json({
+          jsonrpc: "2.0",
+          id,
+          result: result.result,
+          error: result.error,
+          _meta: {
+            rpcUsed: endpoint.name,
+            latencyMs: Date.now() - startTime,
+            cachedResult: false,
+            retries
+          }
+        });
+      } catch (e) {
+        lastError = e;
+        retries++;
+        // Continue to next endpoint
+      }
+    }
+    
+    // All endpoints failed
+    console.error("RPC proxy: all endpoints failed", lastError?.message);
+    res.status(503).json({
+      jsonrpc: "2.0",
+      id,
+      error: { 
+        code: -32603, 
+        message: "All RPC endpoints unavailable",
+        data: { 
+          lastError: lastError?.message,
+          endpointsTried: retries,
+          suggestion: "Try again in 30 seconds"
+        }
+      },
+      _meta: {
+        rpcUsed: null,
+        latencyMs: Date.now() - startTime,
+        cachedResult: false,
+        retries
+      }
+    });
+    
+  } catch (error) {
+    console.error("RPC proxy error:", error);
+    res.status(500).json({ 
+      jsonrpc: "2.0",
+      id: req.body?.id || 1,
+      error: { code: -32603, message: error.message }
+    });
   }
 });
 
